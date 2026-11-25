@@ -45,8 +45,23 @@ class PaymosController extends AppController
 
     public function preAction(): void
     {
+        if (isset($this->structure) && is_object($this->structure)
+            && method_exists($this->structure, 'setDefaultView') && defined('APPDIR')) {
+            $this->structure->setDefaultView(APPDIR);
+        }
         if (is_callable(array('parent', 'preAction'))) {
             parent::preAction();
+        }
+        if (isset($this->view) && is_object($this->view)) {
+            $this->view->view = 'default';
+        }
+        if (isset($this->structure) && is_object($this->structure)) {
+            if (method_exists($this->structure, 'setDefaultView') && defined('APPDIR')) {
+                $this->structure->setDefaultView(APPDIR);
+            }
+            if (isset($this->structure->view) && method_exists($this->structure, 'setView')) {
+                $this->structure->setView(null, $this->structure->view);
+            }
         }
         if (class_exists('Language') && method_exists('Language', 'loadLang')) {
             Language::loadLang('paymos_plugin', null, __DIR__ . DIRECTORY_SEPARATOR . 'language' . DIRECTORY_SEPARATOR);

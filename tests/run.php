@@ -346,6 +346,12 @@ if (!class_exists('AppController', false)) {
         /** @var array<int|string, mixed> */
         public $get = array();
 
+        /** @var object|null */
+        public $view;
+
+        /** @var object|null */
+        public $structure;
+
         public function preAction(): void
         {
         }
@@ -2587,6 +2593,17 @@ runTest('7.4 Blesta 6.0.5 live compatibility: non-static Form CSRF, transactions
     $mvcCtrl->setDbDriver($db);
     $mvcCtrl->setStaffAuthenticator(static fn (): bool => true);
     $mvcCtrl->get = array(0 => '42');
+    $mvcCtrl->view = (object) array('view' => 'paradigm');
+    $mvcCtrl->structure = new class {
+        public string $view = 'paradigm';
+        public ?string $defaultView = null;
+        public ?string $restoredView = null;
+        public function setDefaultView(string $path): void { $this->defaultView = $path; }
+        public function setView($view, string $path): void { $this->restoredView = $path; }
+    };
+    $mvcCtrl->preAction();
+    assertSame('default', $mvcCtrl->view->view, 'PaymosController::preAction() must set plugin view theme to default for Blesta 6.0 Paradigm.');
+    assertSame('paradigm', $mvcCtrl->structure->restoredView, 'PaymosController::preAction() must preserve Blesta admin structure view.');
     $mvcCtrl->index();
     assertTrue(isset($capturedVars['content']) && strpos($capturedVars['content'], 'value="42"') !== false, 'AdminRefunds::index() must resolve $this->get[0] and pass HTML to Blesta view via set().');
 
