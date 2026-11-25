@@ -1,0 +1,15 @@
+<?php
+$safePaymentUrl = $this->Html->safe(isset($payment_url) ? (string) $payment_url : '');
+$submitLabel = $this->Html->safe(
+    isset($button_text) && is_string($button_text) && trim($button_text) !== ''
+        ? trim($button_text)
+        : $this->_('Paymos.buildprocess.submit', true)
+);
+$noteText = $this->Html->safe($this->_('Paymos.buildprocess.note', true));
+?>
+<div class="paymos-checkout-redirect">
+    <p><?php echo $noteText; ?></p>
+    <p>
+        <a href="<?php echo $safePaymentUrl; ?>" class="btn btn-primary" rel="noopener noreferrer"><?php echo $submitLabel; ?></a>
+    </p>
+</div>

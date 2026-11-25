@@ -1,0 +1,34 @@
+{
+  "version": "1.0.0",
+  "name": "Paymos.name",
+  "description": "Paymos.description",
+  "authors": [
+    {
+      "name": "Paymos Labs",
+      "url": "https://paymos.io"
+    }
+  ],
+  "currencies": [
+    "USD",
+    "EUR",
+    "GBP",
+    "CAD",
+    "AUD",
+    "CHF",
+    "JPY",
+    "SGD",
+    "HKD",
+    "AED",
+    "TRY",
+    "BRL",
+    "MXN",
+    "PLN",
+    "CZK",
+    "SEK",
+    "NOK",
+    "DKK",
+    "NZD",
+    "INR"
+  ],
+  "signup_url": "https://paymos.io"
+}

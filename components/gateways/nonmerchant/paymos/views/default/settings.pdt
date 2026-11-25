@@ -1,0 +1,149 @@
+<?php
+$isConnected = !empty($is_connected);
+$connectUrl = isset($connect_url) && is_string($connect_url) ? $connect_url : '/admin/plugin/paymos/admin_connect/';
+$csrfToken = isset($csrf_token) && is_string($csrf_token) ? $csrf_token : '';
+$webhookUrl = isset($webhook_url) && is_string($webhook_url) ? $webhook_url : '/callback/gw/1/paymos/';
+$connectLabels = isset($connect_labels) && is_array($connect_labels) ? $connect_labels : array(
+    'button' => $this->_('Paymos.connect.button', true),
+    'reconnect' => $this->_('Paymos.connect.reconnect', true),
+    'starting' => $this->_('Paymos.connect.starting', true),
+    'waiting' => $this->_('Paymos.connect.waiting', true),
+    'open' => $this->_('Paymos.connect.open', true),
+    'blocked' => $this->_('Paymos.connect.blocked', true),
+    'code' => $this->_('Paymos.connect.code', true),
+    'failed' => $this->_('Paymos.connect.failed', true),
+);
+$jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE;
+?>
+<ul>
+    <li>
+        <label><?php echo $this->Html->safe($this->_('Paymos.connection', true)); ?></label>
+        <div id="paymos-connect-panel" class="paymos-connect-panel">
+            <p class="paymos-connection-state">
+                <strong>
+                    <?php echo $this->Html->safe($isConnected
+                        ? $this->_('Paymos.connection.connected', true)
+                        : $this->_('Paymos.connection.disconnected', true)); ?>
+                </strong>
+            </p>
+            <p>
+                <button
+                    type="button"
+                    id="paymos-connect-button"
+                    class="btn btn-primary"
+                    data-connect-url="<?php echo $this->Html->safe($connectUrl); ?>"
+                    data-csrf-token="<?php echo $this->Html->safe($csrfToken); ?>"
+                ><?php echo $this->Html->safe($isConnected ? $connectLabels['reconnect'] : $connectLabels['button']); ?></button>
+                <span id="paymos-connect-status" class="paymos-connect-status" role="status" aria-live="polite"></span>
+            </p>
+            <span class="tooltip"><?php echo $this->Html->safe($this->_('Paymos.connection.note', true)); ?></span>
+        </div>
+    </li>
+    <li>
+        <?php
+        $this->Form->label($this->_('Paymos.mode', true), 'paymos_mode');
+        $this->Form->fieldSelect(
+            'mode',
+            (isset($modes) && is_array($modes) ? $modes : array('sandbox' => 'Sandbox (Test)', 'live' => 'Live (Mainnet)')),
+            (isset($meta['mode']) ? $meta['mode'] : 'sandbox'),
+            array('id' => 'paymos_mode')
+        );
+        ?>
+        <span class="tooltip"><?php echo $this->Html->safe($this->_('Paymos.mode_note', true)); ?></span>
+    </li>
+    <li>
+        <?php
+        $this->Form->label($this->_('Paymos.button_text', true), 'paymos_button_text');
+        $this->Form->fieldText(
+            'button_text',
+            (isset($meta['button_text']) ? $meta['button_text'] : $this->_('Paymos.button_text_default', true)),
+            array('id' => 'paymos_button_text', 'class' => 'block', 'maxlength' => '100')
+        );
+        ?>
+        <span class="tooltip"><?php echo $this->Html->safe($this->_('Paymos.button_text_note', true)); ?></span>
+    </li>
+    <li>
+        <label><?php echo $this->Html->safe($this->_('Paymos.webhook_url', true)); ?></label>
+        <p><code id="paymos_webhook_url"><?php echo $this->Html->safe($webhookUrl); ?></code></p>
+        <span class="tooltip"><?php echo $this->Html->safe($this->_('Paymos.webhook_url_note', true)); ?></span>
+    </li>
+</ul>
+<script>
+(function(){
+    var btn = document.getElementById('paymos-connect-button');
+    var statusEl = document.getElementById('paymos-connect-status');
+    if (!btn || !statusEl) { return; }
+    var labels = <?php echo json_encode($connectLabels, $jsonFlags); ?>;
+    var endpoint = btn.getAttribute('data-connect-url') || '/admin/plugin/paymos/admin_connect/';
+    var fallbackToken = btn.getAttribute('data-csrf-token') || '';
+    var manual = false;
+
+    function getCsrfToken() {
+        var form = btn.closest('form');
+        var input = form ? form.querySelector('input[name="_csrf_token"]') : document.querySelector('input[name="_csrf_token"]');
+        return (input && input.value) ? input.value : fallbackToken;
+    }
+
+    function post(action, returnUrl) {
+        var body = new URLSearchParams();
+        body.set('action', action);
+        body.set('_csrf_token', getCsrfToken());
+        if (returnUrl) { body.set('return_url', returnUrl); }
+        return fetch(endpoint, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+            body: body.toString()
+        }).then(function(res){
+            return res.json().then(function(data){
+                if (!res.ok) { throw new Error((data && data.error) ? data.error : labels.failed); }
+                return data;
+            });
+        });
+    }
+
+    btn.addEventListener('click', function(){
+        btn.disabled = true;
+        manual = false;
+        statusEl.textContent = labels.starting;
+        var tab = window.open('', '_blank');
+        if (tab) { try { tab.opener = null; } catch (e) {} }
+
+        post('start', window.location.href).then(function(data){
+            if (!data || !data.verification_url) { throw new Error(labels.failed); }
+            if (tab && !tab.closed) {
+                tab.location = data.verification_url;
+                statusEl.textContent = labels.waiting + ' ' + labels.code + ' ' + data.user_code;
+            } else {
+                manual = true;
+                statusEl.textContent = '';
+                var link = document.createElement('a');
+                link.href = data.verification_url;
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                link.textContent = labels.open;
+                statusEl.appendChild(document.createTextNode(labels.blocked + ' '));
+                statusEl.appendChild(link);
+                statusEl.appendChild(document.createTextNode(' ' + labels.code + ' ' + data.user_code));
+            }
+            var intervalMs = Math.max(1, Number(data.interval || 5)) * 1000;
+            setTimeout(function poll(){
+                post('poll').then(function(p){
+                    if (p && p.status === 'connected') {
+                        window.location.reload();
+                        return;
+                    }
+                    setTimeout(poll, (p && p.status === 'slow_down') ? intervalMs + 5000 : intervalMs);
+                }).catch(function(){
+                    if (!manual) { statusEl.textContent = labels.failed; }
+                    btn.disabled = false;
+                });
+            }, intervalMs);
+        }).catch(function(err){
+            if (tab && !tab.closed) { tab.close(); }
+            statusEl.textContent = (err && err.message) ? err.message : labels.failed;
+            btn.disabled = false;
+        });
+    });
+})();
+</script>

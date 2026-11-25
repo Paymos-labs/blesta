@@ -1,0 +1,11 @@
+{
+  "version": "1.0.0",
+  "name": "PaymosPlugin.name",
+  "description": "PaymosPlugin.description",
+  "authors": [
+    {
+      "name": "Paymos Labs",
+      "url": "https://paymos.io"
+    }
+  ]
+}

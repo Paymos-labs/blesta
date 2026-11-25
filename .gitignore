@@ -1,0 +1,4 @@
+dist/
+components/gateways/nonmerchant/paymos/vendor/
+.DS_Store
+*.log
