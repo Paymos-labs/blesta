@@ -1,0 +1,5 @@
+<div class="card">
+    <div class="card-body">
+        <?php echo isset($content) && is_string($content) ? $content : ''; ?>
+    </div>
+</div>

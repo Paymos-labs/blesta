@@ -137,8 +137,30 @@ class PaymosController extends AppController
             return;
         }
 
+        if (isset($this->Form) && is_object($this->Form) && method_exists($this->Form, 'verifyCsrfToken')) {
+            $ref = new \ReflectionMethod($this->Form, 'verifyCsrfToken');
+            $valid = $ref->getNumberOfParameters() >= 2
+                ? $this->Form->verifyCsrfToken(null, $provided)
+                : $this->Form->verifyCsrfToken($provided);
+            if ($valid !== true) {
+                throw new \RuntimeException('paymos_csrf_invalid', 403);
+            }
+            return;
+        }
+
         if (class_exists('Form') && method_exists('Form', 'verifyCsrfToken')) {
-            if (\Form::verifyCsrfToken($provided) !== true) {
+            $ref = new \ReflectionMethod('Form', 'verifyCsrfToken');
+            if ($ref->isStatic()) {
+                $valid = $ref->getNumberOfParameters() >= 2
+                    ? \Form::verifyCsrfToken(null, $provided)
+                    : \Form::verifyCsrfToken($provided);
+            } else {
+                $form = new \Form();
+                $valid = $ref->getNumberOfParameters() >= 2
+                    ? $form->verifyCsrfToken(null, $provided)
+                    : $form->verifyCsrfToken($provided);
+            }
+            if ($valid !== true) {
                 throw new \RuntimeException('paymos_csrf_invalid', 403);
             }
             return;
@@ -156,10 +178,26 @@ class PaymosController extends AppController
 
     protected function resolveCsrfToken(): string
     {
+        if (isset($this->Form) && is_object($this->Form) && method_exists($this->Form, 'getCsrfToken')) {
+            try {
+                $token = $this->Form->getCsrfToken();
+                if (is_scalar($token) && trim((string) $token) !== '') {
+                    return trim((string) $token);
+                }
+            } catch (\Throwable $e) {
+                // Fall through to Form helper fallback.
+            }
+        }
+
         if (class_exists('Form') && method_exists('Form', 'getCsrfToken')) {
-            $token = \Form::getCsrfToken();
-            if (is_scalar($token) && trim((string) $token) !== '') {
-                return trim((string) $token);
+            try {
+                $ref = new \ReflectionMethod('Form', 'getCsrfToken');
+                $token = $ref->isStatic() ? \Form::getCsrfToken() : (new \Form())->getCsrfToken();
+                if (is_scalar($token) && trim((string) $token) !== '') {
+                    return trim((string) $token);
+                }
+            } catch (\Throwable $e) {
+                // Fall through to session fallback.
             }
         }
         if (isset($_SESSION['_csrf_token']) && is_scalar($_SESSION['_csrf_token'])) {

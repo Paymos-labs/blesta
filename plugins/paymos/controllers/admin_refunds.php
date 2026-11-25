@@ -32,16 +32,24 @@ class AdminRefunds extends PaymosController
         $this->refundNativeHandler = $handler;
     }
 
-    public function index(): void
+    public function index()
     {
-        $invoiceId = isset($_GET['invoice_id']) && is_numeric($_GET['invoice_id']) ? (int) $_GET['invoice_id'] : 0;
+        $invoiceId = $this->resolveInvoiceIdFromRequest();
         $response = $this->handleIndexPage($invoiceId);
+        if (method_exists($this, 'set')) {
+            if ($response['http_status'] !== 200 && PHP_SAPI !== 'cli' && !headers_sent()) {
+                http_response_code($response['http_status']);
+            }
+            $this->set('content', $response['html']);
+            return null;
+        }
         if (PHP_SAPI !== 'cli' && !headers_sent()) {
             http_response_code($response['http_status']);
             header('Content-Type: text/html; charset=utf-8');
             header('Cache-Control: private, no-store');
         }
         echo $response['html'];
+        return false;
     }
 
     /**
@@ -167,18 +175,36 @@ class AdminRefunds extends PaymosController
         );
     }
 
-    public function panel(): void
+    public function panel()
     {
-        $invoiceId = isset($_GET['invoice_id']) && is_numeric($_GET['invoice_id']) ? (int) $_GET['invoice_id'] : 0;
+        $invoiceId = $this->resolveInvoiceIdFromRequest();
         $response = $this->handlePanelRequest($invoiceId);
         $this->emitJsonResponse($response['http_status'], $response['body']);
+        return false;
     }
 
-    public function submit(): void
+    public function submit()
     {
         $method = isset($_SERVER['REQUEST_METHOD']) ? strtoupper((string) $_SERVER['REQUEST_METHOD']) : 'GET';
         $response = $this->handleSubmitRequest($method, $_POST, $_SERVER);
         $this->emitJsonResponse($response['http_status'], $response['body']);
+        return false;
+    }
+
+    private function resolveInvoiceIdFromRequest(): int
+    {
+        if (isset($_GET['invoice_id']) && is_numeric($_GET['invoice_id']) && (int) $_GET['invoice_id'] > 0) {
+            return (int) $_GET['invoice_id'];
+        }
+        if (isset($this->get) && is_array($this->get)) {
+            if (isset($this->get['invoice_id']) && is_numeric($this->get['invoice_id']) && (int) $this->get['invoice_id'] > 0) {
+                return (int) $this->get['invoice_id'];
+            }
+            if (isset($this->get[0]) && is_numeric($this->get[0]) && (int) $this->get[0] > 0) {
+                return (int) $this->get[0];
+            }
+        }
+        return 0;
     }
 
     /**

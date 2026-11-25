@@ -340,6 +340,12 @@ if (!class_exists('AppController', false)) {
         /** @var object|null */
         public $Session;
 
+        /** @var object|null */
+        public $Form;
+
+        /** @var array<int|string, mixed> */
+        public $get = array();
+
         public function preAction(): void
         {
         }
@@ -2487,7 +2493,7 @@ runTest('7.1 All 6 Blesta locales have full key parity, real native translations
 
 runTest('7.2 config.json ISO 4217 currencies, canonical README/CHANGELOG/LICENSE, zero-leak, and legacy deletions', function () use ($pluginRoot, $gatewayRoot) {
     $cfg = json_decode((string) file_get_contents($gatewayRoot . DIRECTORY_SEPARATOR . 'config.json'), true);
-    assertSame('1.0.0', $cfg['version']);
+    assertTrue(preg_match('/^\d+\.\d+\.\d+$/', (string) ($cfg['version'] ?? '')) === 1, 'config.json version must be valid SemVer.');
     assertTrue(count($cfg['currencies']) >= 15);
     foreach ($cfg['currencies'] as $curr) {
         assertTrue(preg_match('/\A[A-Z]{3}\z/', (string) $curr) === 1, "Invalid currency code: {$curr}");
@@ -2535,6 +2541,201 @@ runTest('7.3 PHP syntax lint (php -l) passes across all Blesta PHP and PDT files
         $checked++;
     }
     assertTrue($checked >= 25, "Expected at least 25 PHP/PDT files linted, got {$checked}");
+});
+
+runTest('7.4 Blesta 6.0.5 live compatibility: non-static Form CSRF, transactions.message marker, logos, and AdminRefunds MVC', function () use ($pluginRoot, $gatewayRoot, $companionRoot) {
+    // #B-3: Both gateway and companion plugin bundle light/dark SVG + PNG logos and declare Blesta 6.0 config.json logo/icon
+    foreach (array($gatewayRoot, $companionRoot) as $dir) {
+        $cfg = json_decode((string) file_get_contents($dir . DIRECTORY_SEPARATOR . 'config.json'), true);
+        assertSame('views/default/images/logo.svg', $cfg['logo']['light'] ?? null, 'Missing light logo in ' . $dir);
+        assertSame('views/default/images/logo-dark.svg', $cfg['logo']['dark'] ?? null, 'Missing dark logo in ' . $dir);
+        foreach (array('logo.svg', 'logo-dark.svg', 'logo.png') as $img) {
+            $imgPath = $dir . DIRECTORY_SEPARATOR . 'views' . DIRECTORY_SEPARATOR . 'default' . DIRECTORY_SEPARATOR . 'images' . DIRECTORY_SEPARATOR . $img;
+            assertTrue(is_file($imgPath) && filesize($imgPath) > 100, 'Missing or empty brand asset: ' . $imgPath);
+        }
+    }
+    $pluginCfg = json_decode((string) file_get_contents($companionRoot . DIRECTORY_SEPARATOR . 'config.json'), true);
+    assertSame('bi bi-currency-exchange', $pluginCfg['icon'] ?? null, 'Companion plugin config.json must declare Bootstrap icon.');
+
+    // #B-4: admin_refunds.pdt exists, positional $this->get[0] works, JSON actions return false
+    $pdtPath = $companionRoot . DIRECTORY_SEPARATOR . 'views' . DIRECTORY_SEPARATOR . 'default' . DIRECTORY_SEPARATOR . 'admin_refunds.pdt';
+    assertTrue(is_file($pdtPath), 'plugins/paymos/views/default/admin_refunds.pdt must exist.');
+
+    $db = new InMemoryDbDriver();
+    $credStore74 = new CredentialStore($db, static fn (): string => Configure::get('Blesta.system_key'));
+    $credStore74->saveCredentials(array(
+        'sandbox' => array(
+            'project_id' => 'prj_blesta_74',
+            'api_key' => 'pk_test_blesta_74_00001',
+            'api_secret' => 'sk_test_blesta_74_00001',
+            'webhook_secret' => 'whsec_blesta_74_0000001',
+            'base_url' => 'https://api.paymos.io',
+            'capabilities' => array('invoice_refunds_v1'),
+            'refund_contract_version' => 1,
+        ),
+    ));
+    $ctrl = new AdminRefunds();
+    $ctrl->setDbDriver($db);
+    $ctrl->setStaffAuthenticator(static fn (): bool => true);
+    $ctrl->get = array(0 => '42');
+    $capturedVars = array();
+    $mvcCtrl = new class($capturedVars) extends AdminRefunds {
+        public array $vars;
+        public function __construct(array &$vars) { $this->vars = &$vars; }
+        public function set(string $key, $value): void { $this->vars[$key] = $value; }
+    };
+    $mvcCtrl->setDbDriver($db);
+    $mvcCtrl->setStaffAuthenticator(static fn (): bool => true);
+    $mvcCtrl->get = array(0 => '42');
+    $mvcCtrl->index();
+    assertTrue(isset($capturedVars['content']) && strpos($capturedVars['content'], 'value="42"') !== false, 'AdminRefunds::index() must resolve $this->get[0] and pass HTML to Blesta view via set().');
+
+    ob_start();
+    $panelRet = $ctrl->panel();
+    $panelJson = (string) ob_get_clean();
+    assertSame(false, $panelRet, 'AdminRefunds::panel() must return false to suppress Blesta view rendering.');
+    assertTrue(strpos($panelJson, '"invoice_id":42') !== false, 'AdminRefunds::panel() must read positional $this->get[0]. Got: ' . $panelJson);
+
+    $connectCtrl = new AdminConnect();
+    $connectCtrl->setDbDriver($db);
+    $connectCtrl->setStaffAuthenticator(static fn (): bool => false);
+    ob_start();
+    $connectRet = $connectCtrl->start();
+    ob_end_clean();
+    assertSame(false, $connectRet, 'AdminConnect::start() must return false to suppress Blesta view rendering.');
+
+    // #B-1 & #B-2: Isolated subprocess testing real Minphp\Form non-static 2-arg CSRF + Blesta transactions.message column
+    $probe = <<<'PHP'
+class Form {
+    public function getCsrfToken($key = null) { return 'instance-csrf-token-605'; }
+    public function verifyCsrfToken($key = null, $csrf_token = null) {
+        return is_string($csrf_token) && hash_equals('instance-csrf-token-605', $csrf_token);
+    }
+}
+class AppController {
+    public $Form;
+    public $get = [];
+    public function __construct() { $this->Form = new Form(); }
+    public function preAction() {}
+}
+class Loader {
+    public static array $txStore = [];
+    public static array $invStore = [];
+    public static function loadModels(object $host, array $models): void {
+        if (in_array('Invoices', $models, true)) {
+            $host->Invoices = new class {
+                public function get(int $id) { return Loader::$invStore[$id] ?? null; }
+            };
+        }
+        if (in_array('Transactions', $models, true)) {
+            $host->Transactions = new class {
+                public function get(int $id) { return Loader::$txStore[$id] ?? null; }
+                public function getByReference(string $ref, string $txid) {
+                    foreach (Loader::$txStore as $t) {
+                        if ($t->reference_id === $ref) return $t;
+                    }
+                    return null;
+                }
+                public function edit(int $id, array $vars): void {
+                    // Simulate real Blesta 6.0.5 Transactions::edit() which ONLY updates whitelisted columns (message, NOT notes!)
+                    $t = Loader::$txStore[$id];
+                    if (isset($vars['status'])) $t->status = $vars['status'];
+                    if (isset($vars['message'])) $t->message = substr((string) $vars['message'], 0, 255);
+                }
+                public function errors() { return null; }
+            };
+        }
+    }
+}
+$pluginRoot = $argv[1];
+require_once $pluginRoot . '/plugins/paymos/controllers/admin_connect.php';
+$ac = new AdminConnect();
+$ac->setStaffAuthenticator(static fn (): bool => true);
+$resOk = $ac->handleRequest('POST', ['action' => 'invalid', '_csrf_token' => 'instance-csrf-token-605']);
+$resBad = $ac->handleRequest('POST', ['action' => 'invalid', '_csrf_token' => 'wrong-token']);
+if ($resOk['http_status'] !== 400 || $resBad['http_status'] !== 403) {
+    echo 'CSRF_FAIL:' . json_encode([$resOk, $resBad]);
+    exit(1);
+}
+
+// Test Transactions::edit() writing 'message' and marker/snapshot reading 'message' (without 'notes')
+Loader::$invStore[5] = (object) ['id' => 5, 'client_id' => 9, 'status' => 'active', 'total' => '17.00', 'currency' => 'USD'];
+Loader::$txStore[10] = (object) ['id' => 10, 'client_id' => 9, 'transaction_id' => '0xtx_5', 'reference_id' => 'inv_b605', 'amount' => '17.00', 'currency' => 'USD', 'status' => 'approved', 'message' => ''];
+
+$memDb = new class implements \PaymosBlesta\DbDriverInterface {
+    private array $settings = [];
+    public function driverName(): string { return 'memory'; }
+    public function inTransaction(): bool { return false; }
+    public function tableExists(string $table): bool { return true; }
+    public function execute(string $sql, array $params = []): int {
+        if (str_contains($sql, 'UPDATE') && count($params) >= 3) {
+            $this->settings[(string) $params[2]] = (string) $params[0];
+        }
+        return 1;
+    }
+    public function fetchOne(string $sql, array $params = []): ?array {
+        $k = (string) ($params[0] ?? '');
+        return isset($this->settings[$k]) ? ['setting_value' => $this->settings[$k]] : null;
+    }
+    public function fetchAll(string $sql, array $params = []): array { return []; }
+    public function insertUnique(string $table, array $columns, ?string $conflictColumn = null): bool {
+        if (isset($columns['setting_key'], $columns['setting_value'])) {
+            $k = (string) $columns['setting_key'];
+            if (isset($this->settings[$k])) return false;
+            $this->settings[$k] = (string) $columns['setting_value'];
+        }
+        return true;
+    }
+    public function casUpdate(string $table, array $set, array $where, array $conditions = []): int { return 1; }
+    public function deleteExpired(string $table, string $column, int $now, int $limit = 100): int { return 0; }
+    public function beginTransaction(): void {}
+    public function commit(): bool { return true; }
+    public function rollBack(): void {}
+    public function acquireNamedLock(string $name, int $timeoutSeconds = 10): bool { return true; }
+    public function isNamedLockOwned(string $name): bool { return true; }
+    public function releaseNamedLock(string $name): void {}
+};
+$credStore = new \PaymosBlesta\CredentialStore($memDb, static fn (): string => 'blesta-605-system-key-32-chars!!', static fn (): int => 1795640000);
+$credStore->saveCredentials([
+    'sandbox' => [
+        'project_id' => 'prj_b605',
+        'api_key' => 'pk_test_b605_000000001',
+        'api_secret' => 'sk_test_b605_000000001',
+        'webhook_secret' => 'whsec_b605_00000000001',
+        'base_url' => 'https://api.paymos.io',
+        'capabilities' => ['invoice_refunds_v1'],
+        'refund_contract_version' => 1,
+    ],
+]);
+$cfg = \PaymosBlesta\Config::fromStore(['mode' => 'sandbox'], $credStore);
+$snaps = new \PaymosBlesta\SnapshotStore($memDb, static fn (): int => 1795640000);
+$intents = new \PaymosBlesta\RefundIntentStore($memDb, $credStore, static fn (): int => 1795640000);
+$adapter = new \PaymosBlesta\RefundAdapter($cfg, $credStore, $snaps, $intents, null, null, null, static fn (): int => 1795640000);
+$callNative = new \ReflectionMethod($adapter, 'callNative');
+$callNative->invoke($adapter, 'Transactions::edit', [
+    'transaction_id' => 10,
+    'invoice_id' => 5,
+    'vars' => [
+        'status' => 'refunded',
+        'reference_id' => 'inv_b605',
+        'transaction_id' => '0xtx_5',
+        'message' => 'Paymos full refund completed [paymos_refund_wdr_605] (17 USDT/TRON)',
+        'notes' => 'ignored by real Blesta',
+    ],
+]);
+$markers = $callNative->invoke($adapter, 'marker', ['transaction_id' => 10, 'marker' => 'paymos_refund_wdr_605']);
+$ok = count($markers) === 1 && ($markers[0]['status'] ?? '') === 'refunded' && str_contains((string) ($markers[0]['message'] ?? ''), 'paymos_refund_wdr_605');
+echo $ok ? 'OK' : ('MARKER_FAIL:' . json_encode([$markers, Loader::$txStore[10]]));
+exit($ok ? 0 : 1);
+PHP;
+    $tmp = tempnam(sys_get_temp_dir(), 'blesta605_probe_');
+    file_put_contents($tmp, "<?php\n" . $probe);
+    $out = array();
+    $code = 0;
+    exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($tmp) . ' ' . escapeshellarg($pluginRoot) . ' 2>&1', $out, $code);
+    @unlink($tmp);
+    assertSame(0, $code, 'Blesta 6.0.5 subprocess probe failed: ' . implode("\n", $out));
+    assertSame('OK', trim(implode('', $out)));
 });
 
 echo "\nBlesta test summary: {$passed} passed, {$failed} failed.\n";

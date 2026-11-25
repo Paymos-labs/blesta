@@ -15,59 +15,61 @@ $connectLabels = isset($connect_labels) && is_array($connect_labels) ? $connect_
 );
 $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE;
 ?>
-<ul>
-    <li>
-        <label><?php echo $this->Html->safe($this->_('Paymos.connection', true)); ?></label>
-        <div id="paymos-connect-panel" class="paymos-connect-panel">
-            <p class="paymos-connection-state">
-                <strong>
+<div class="mb-3">
+    <label class="form-label"><?php echo $this->Html->safe($this->_('Paymos.connection', true)); ?></label>
+    <div id="paymos-connect-panel" class="paymos-connect-panel border rounded p-3 bg-body-tertiary">
+        <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
+            <div class="paymos-connection-state">
+                <span class="badge <?php echo $isConnected ? 'bg-success' : 'bg-secondary'; ?>">
                     <?php echo $this->Html->safe($isConnected
                         ? $this->_('Paymos.connection.connected', true)
                         : $this->_('Paymos.connection.disconnected', true)); ?>
-                </strong>
-            </p>
-            <p>
+                </span>
+            </div>
+            <div>
                 <button
                     type="button"
                     id="paymos-connect-button"
-                    class="btn btn-primary"
+                    class="btn btn-primary btn-sm"
                     data-connect-url="<?php echo $this->Html->safe($connectUrl); ?>"
                     data-csrf-token="<?php echo $this->Html->safe($csrfToken); ?>"
                 ><?php echo $this->Html->safe($isConnected ? $connectLabels['reconnect'] : $connectLabels['button']); ?></button>
-                <span id="paymos-connect-status" class="paymos-connect-status" role="status" aria-live="polite"></span>
-            </p>
-            <span class="tooltip"><?php echo $this->Html->safe($this->_('Paymos.connection.note', true)); ?></span>
+            </div>
         </div>
-    </li>
-    <li>
-        <?php
-        $this->Form->label($this->_('Paymos.mode', true), 'paymos_mode');
-        $this->Form->fieldSelect(
-            'mode',
-            (isset($modes) && is_array($modes) ? $modes : array('sandbox' => 'Sandbox (Test)', 'live' => 'Live (Mainnet)')),
-            (isset($meta['mode']) ? $meta['mode'] : 'sandbox'),
-            array('id' => 'paymos_mode')
-        );
-        ?>
-        <span class="tooltip"><?php echo $this->Html->safe($this->_('Paymos.mode_note', true)); ?></span>
-    </li>
-    <li>
-        <?php
-        $this->Form->label($this->_('Paymos.button_text', true), 'paymos_button_text');
-        $this->Form->fieldText(
-            'button_text',
-            (isset($meta['button_text']) ? $meta['button_text'] : $this->_('Paymos.button_text_default', true)),
-            array('id' => 'paymos_button_text', 'class' => 'block', 'maxlength' => '100')
-        );
-        ?>
-        <span class="tooltip"><?php echo $this->Html->safe($this->_('Paymos.button_text_note', true)); ?></span>
-    </li>
-    <li>
-        <label><?php echo $this->Html->safe($this->_('Paymos.webhook_url', true)); ?></label>
-        <p><code id="paymos_webhook_url"><?php echo $this->Html->safe($webhookUrl); ?></code></p>
-        <span class="tooltip"><?php echo $this->Html->safe($this->_('Paymos.webhook_url_note', true)); ?></span>
-    </li>
-</ul>
+        <div id="paymos-connect-status" class="paymos-connect-status small text-muted mt-2" role="status" aria-live="polite"></div>
+        <div class="form-text mt-1"><?php echo $this->Html->safe($this->_('Paymos.connection.note', true)); ?></div>
+    </div>
+</div>
+<div class="mb-3">
+    <?php
+    $this->Form->label($this->_('Paymos.mode', true), 'paymos_mode', array('class' => 'form-label'));
+    $this->Form->fieldSelect(
+        'mode',
+        (isset($modes) && is_array($modes) ? $modes : array('sandbox' => 'Sandbox (Test)', 'live' => 'Live (Mainnet)')),
+        (isset($meta['mode']) ? $meta['mode'] : 'sandbox'),
+        array('id' => 'paymos_mode', 'class' => 'form-select')
+    );
+    ?>
+    <div class="form-text"><?php echo $this->Html->safe($this->_('Paymos.mode_note', true)); ?></div>
+</div>
+<div class="mb-3">
+    <?php
+    $this->Form->label($this->_('Paymos.button_text', true), 'paymos_button_text', array('class' => 'form-label'));
+    $this->Form->fieldText(
+        'button_text',
+        (isset($meta['button_text']) ? $meta['button_text'] : $this->_('Paymos.button_text_default', true)),
+        array('id' => 'paymos_button_text', 'class' => 'form-control', 'maxlength' => '100')
+    );
+    ?>
+    <div class="form-text"><?php echo $this->Html->safe($this->_('Paymos.button_text_note', true)); ?></div>
+</div>
+<div class="mb-3">
+    <label class="form-label" for="paymos_webhook_url"><?php echo $this->Html->safe($this->_('Paymos.webhook_url', true)); ?></label>
+    <div class="border rounded px-3 py-2 bg-body-tertiary font-monospace small">
+        <code id="paymos_webhook_url"><?php echo $this->Html->safe($webhookUrl); ?></code>
+    </div>
+    <div class="form-text"><?php echo $this->Html->safe($this->_('Paymos.webhook_url_note', true)); ?></div>
+</div>
 <script>
 (function(){
     var btn = document.getElementById('paymos-connect-button');

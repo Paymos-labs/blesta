@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.1",
   "name": "Paymos.name",
   "description": "Paymos.description",
   "authors": [
@@ -30,5 +30,9 @@
     "NZD",
     "INR"
   ],
-  "signup_url": "https://paymos.io"
+  "signup_url": "https://paymos.io",
+  "logo": {
+    "light": "views/default/images/logo.svg",
+    "dark": "views/default/images/logo-dark.svg"
+  }
 }

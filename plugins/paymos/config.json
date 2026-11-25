@@ -1,7 +1,12 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.1",
   "name": "PaymosPlugin.name",
   "description": "PaymosPlugin.description",
+  "icon": "bi bi-currency-exchange",
+  "logo": {
+    "light": "views/default/images/logo.svg",
+    "dark": "views/default/images/logo-dark.svg"
+  },
   "authors": [
     {
       "name": "Paymos Labs",

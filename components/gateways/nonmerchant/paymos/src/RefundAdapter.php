@@ -445,7 +445,12 @@ final class RefundAdapter implements NativeRefundProjectorInterface
         }
 
         $markerTag = 'paymos_refund_' . $refund->withdrawalId();
-        $this->store->outsideTransaction(function () use ($intent, $draft, $refund, $markerTag): void {
+        $refundMessage = substr(
+            'Paymos full refund completed [' . $markerTag . '] (' . $refund->principalDecimal() . ' ' . $refund->currency() . '/' . $refund->network() . ')',
+            0,
+            255
+        );
+        $this->store->outsideTransaction(function () use ($intent, $draft, $refund, $markerTag, $refundMessage): void {
             $this->callNative('Transactions::edit', array(
                 'transaction_id' => (int) $draft['blesta_transaction_id'],
                 'invoice_id' => (int) $intent->paymentKey(),
@@ -453,7 +458,8 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                     'status' => 'refunded',
                     'reference_id' => $draft['original_reference_id'],
                     'transaction_id' => $draft['original_transaction_id'],
-                    'notes' => 'Paymos full refund completed [' . $markerTag . '] (' . $refund->principalDecimal() . ' ' . $refund->currency() . '/' . $refund->network() . ')',
+                    'message' => $refundMessage,
+                    'notes' => $refundMessage,
                 ),
                 'marker' => $markerTag,
                 'withdrawal_id' => $refund->withdrawalId(),
@@ -903,6 +909,11 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                         }
 
                         if ($draft !== null) {
+                            $extRefundMessage = substr(
+                                'Paymos Dashboard full refund completed [' . $markerTag . '] (' . $verified->principalDecimal() . ' ' . $verified->currency() . '/' . $verified->network() . ')',
+                                0,
+                                255
+                            );
                             $editResult = $this->callNative('Transactions::edit', array(
                                 'transaction_id' => (int) $draft['blesta_transaction_id'],
                                 'invoice_id' => $blestaInvoiceId,
@@ -910,7 +921,8 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                                     'status' => 'refunded',
                                     'reference_id' => $draft['original_reference_id'],
                                     'transaction_id' => $draft['original_transaction_id'],
-                                    'notes' => 'Paymos Dashboard full refund completed [' . $markerTag . '] (' . $verified->principalDecimal() . ' ' . $verified->currency() . '/' . $verified->network() . ')',
+                                    'message' => $extRefundMessage,
+                                    'notes' => $extRefundMessage,
                                 ),
                                 'marker' => $markerTag,
                                 'withdrawal_id' => $verified->withdrawalId(),
@@ -1290,7 +1302,8 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                     'amount' => (string) ($txObj->amount ?? $mapping['amount']),
                     'currency' => strtoupper(trim((string) ($txObj->currency ?? $mapping['currency']))),
                     'status' => (string) ($txObj->status ?? 'approved'),
-                    'notes' => (string) ($txObj->notes ?? ''),
+                    'message' => trim((string) ($txObj->message ?? '')) !== '' ? (string) $txObj->message : (string) ($txObj->notes ?? ''),
+                    'notes' => trim((string) ($txObj->message ?? '')) !== '' ? (string) $txObj->message : (string) ($txObj->notes ?? ''),
                 ),
                 'mapping' => $mapping,
             );
@@ -1309,7 +1322,9 @@ final class RefundAdapter implements NativeRefundProjectorInterface
             if (!is_object($tx)) {
                 return array();
             }
-            $notes = (string) ($tx->notes ?? '');
+            $notes = trim((string) ($tx->message ?? '')) !== ''
+                ? (string) $tx->message
+                : (string) ($tx->notes ?? '');
             $marker = (string) ($input['marker'] ?? '');
             if (strtolower((string) ($tx->status ?? '')) === 'refunded'
                 && ($marker === '' || strpos($notes, $marker) !== false)) {
@@ -1319,6 +1334,7 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                     'status' => (string) ($tx->status ?? ''),
                     'amount' => (string) ($tx->amount ?? ''),
                     'currency' => strtoupper(trim((string) ($tx->currency ?? ''))),
+                    'message' => $notes,
                     'notes' => $notes,
                 ));
             }

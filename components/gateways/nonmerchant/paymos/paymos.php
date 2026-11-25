@@ -902,10 +902,27 @@ class Paymos extends NonmerchantGateway
 
     private function resolveCsrfToken(): string
     {
+        if (isset($this->view) && is_object($this->view) && isset($this->view->Form)
+            && is_object($this->view->Form) && method_exists($this->view->Form, 'getCsrfToken')) {
+            try {
+                $token = $this->view->Form->getCsrfToken();
+                if (is_scalar($token) && trim((string) $token) !== '') {
+                    return trim((string) $token);
+                }
+            } catch (\Throwable $e) {
+                // Fall through to Form helper fallback.
+            }
+        }
+
         if (class_exists('Form') && method_exists('Form', 'getCsrfToken')) {
-            $token = \Form::getCsrfToken();
-            if (is_scalar($token)) {
-                return trim((string) $token);
+            try {
+                $ref = new \ReflectionMethod('Form', 'getCsrfToken');
+                $token = $ref->isStatic() ? \Form::getCsrfToken() : (new \Form())->getCsrfToken();
+                if (is_scalar($token) && trim((string) $token) !== '') {
+                    return trim((string) $token);
+                }
+            } catch (\Throwable $e) {
+                // Fall through to session token fallback.
             }
         }
 

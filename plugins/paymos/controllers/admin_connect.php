@@ -22,29 +22,32 @@ class AdminConnect extends PaymosController
         $this->connectClient = $client;
     }
 
-    public function index(): void
+    public function index()
     {
         $method = isset($_SERVER['REQUEST_METHOD']) ? strtoupper((string) $_SERVER['REQUEST_METHOD']) : 'GET';
         $response = $this->handleRequest($method, $_POST, $_SERVER);
         $this->emitJsonResponse($response['http_status'], $response['body']);
+        return false;
     }
 
-    public function start(): void
+    public function start()
     {
         $post = $_POST;
         $post['action'] = 'start';
         $method = isset($_SERVER['REQUEST_METHOD']) ? strtoupper((string) $_SERVER['REQUEST_METHOD']) : 'GET';
         $response = $this->handleRequest($method, $post, $_SERVER);
         $this->emitJsonResponse($response['http_status'], $response['body']);
+        return false;
     }
 
-    public function poll(): void
+    public function poll()
     {
         $post = $_POST;
         $post['action'] = 'poll';
         $method = isset($_SERVER['REQUEST_METHOD']) ? strtoupper((string) $_SERVER['REQUEST_METHOD']) : 'GET';
         $response = $this->handleRequest($method, $post, $_SERVER);
         $this->emitJsonResponse($response['http_status'], $response['body']);
+        return false;
     }
 
     /**
