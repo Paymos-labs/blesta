@@ -6,6 +6,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-11-26
+
+- fix(blesta): resolve refunded transaction lookup in post-apply snapshot (#B-6)
+- docs(plugins): add 6-language READMEs (EN/zh-CN/ru/es/de/tr) and YouTube walkthrough previews across all 25 Paymos-labs repos
+- chore: bundle Paymos PHP SDK v1.13.0
+
 ## [1.0.2] - 2026-11-25
 
 - fix(blesta): resolve plugin default view under Blesta 6.0 Paradigm admin theme

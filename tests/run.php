@@ -2647,11 +2647,20 @@ class Loader {
         if (in_array('Transactions', $models, true)) {
             $host->Transactions = new class {
                 public function get(int $id) { return Loader::$txStore[$id] ?? null; }
-                public function getByReference(string $ref, string $txid) {
+                public function getByTransactionId(string $txid, ?int $clientId = null) {
                     foreach (Loader::$txStore as $t) {
-                        if ($t->reference_id === $ref) return $t;
+                        if ($t->transaction_id === $txid && ($clientId === null || (int) $t->client_id === $clientId)) return $t;
                     }
                     return null;
+                }
+                public function getList(?int $clientId = null, ?string $status = 'approved'): array {
+                    $out = [];
+                    foreach (Loader::$txStore as $t) {
+                        if ($clientId !== null && (int) $t->client_id !== $clientId) continue;
+                        if ($status !== null && (string) $t->status !== $status) continue;
+                        $out[] = $t;
+                    }
+                    return $out;
                 }
                 public function edit(int $id, array $vars): void {
                     // Simulate real Blesta 6.0.5 Transactions::edit() which ONLY updates whitelisted columns (message, NOT notes!)
@@ -2675,12 +2684,14 @@ if ($resOk['http_status'] !== 400 || $resBad['http_status'] !== 403) {
     exit(1);
 }
 
-// Test Transactions::edit() writing 'message' and marker/snapshot reading 'message' (without 'notes')
+// Test Transactions::edit() writing 'message' and snapshot/marker still finding the refunded transaction
+// under Blesta 6.0.5's real Transactions::getByTransactionId() / getList($clientId, $status = 'approved') API.
 Loader::$invStore[5] = (object) ['id' => 5, 'client_id' => 9, 'status' => 'active', 'total' => '17.00', 'currency' => 'USD'];
 Loader::$txStore[10] = (object) ['id' => 10, 'client_id' => 9, 'transaction_id' => '0xtx_5', 'reference_id' => 'inv_b605', 'amount' => '17.00', 'currency' => 'USD', 'status' => 'approved', 'message' => ''];
 
 $memDb = new class implements \PaymosBlesta\DbDriverInterface {
     private array $settings = [];
+    private array $snapshots = [];
     public function driverName(): string { return 'memory'; }
     public function inTransaction(): bool { return false; }
     public function tableExists(string $table): bool { return true; }
@@ -2691,11 +2702,23 @@ $memDb = new class implements \PaymosBlesta\DbDriverInterface {
         return 1;
     }
     public function fetchOne(string $sql, array $params = []): ?array {
+        if (str_contains($sql, 'paymos_invoice_snapshots')) {
+            return $this->snapshots[0] ?? null;
+        }
         $k = (string) ($params[0] ?? '');
         return isset($this->settings[$k]) ? ['setting_value' => $this->settings[$k]] : null;
     }
-    public function fetchAll(string $sql, array $params = []): array { return []; }
+    public function fetchAll(string $sql, array $params = []): array {
+        if (str_contains($sql, 'paymos_invoice_snapshots')) {
+            return $this->snapshots;
+        }
+        return [];
+    }
     public function insertUnique(string $table, array $columns, ?string $conflictColumn = null): bool {
+        if ($table === 'paymos_invoice_snapshots') {
+            $this->snapshots = [$columns];
+            return true;
+        }
         if (isset($columns['setting_key'], $columns['setting_value'])) {
             $k = (string) $columns['setting_key'];
             if (isset($this->settings[$k])) return false;
@@ -2726,6 +2749,20 @@ $credStore->saveCredentials([
 ]);
 $cfg = \PaymosBlesta\Config::fromStore(['mode' => 'sandbox'], $credStore);
 $snaps = new \PaymosBlesta\SnapshotStore($memDb, static fn (): int => 1795640000);
+$snaps->save([
+    'external_order_id' => 'blesta_inv_5_r0',
+    'paymos_invoice_id' => 'inv_b605',
+    'platform_ref' => 'inv_5',
+    'blesta_invoice_id' => 5,
+    'client_id' => '9',
+    'amount' => '17.00',
+    'currency' => 'USD',
+    'environment' => 'sandbox',
+    'project_id' => 'prj_b605',
+    'payment_url' => 'https://checkout.paymos.io/inv/inv_b605',
+    'transaction_id' => '0xtx_5',
+    'status' => 'paid',
+]);
 $intents = new \PaymosBlesta\RefundIntentStore($memDb, $credStore, static fn (): int => 1795640000);
 $adapter = new \PaymosBlesta\RefundAdapter($cfg, $credStore, $snaps, $intents, null, null, null, static fn (): int => 1795640000);
 $callNative = new \ReflectionMethod($adapter, 'callNative');
@@ -2740,9 +2777,15 @@ $callNative->invoke($adapter, 'Transactions::edit', [
         'notes' => 'ignored by real Blesta',
     ],
 ]);
+// Post-edit snapshot MUST still locate the refunded transaction via getByTransactionId() / getList($clientId, null)
+$snapAfter = $callNative->invoke($adapter, 'snapshot', ['invoice_id' => 5]);
 $markers = $callNative->invoke($adapter, 'marker', ['transaction_id' => 10, 'marker' => 'paymos_refund_wdr_605']);
-$ok = count($markers) === 1 && ($markers[0]['status'] ?? '') === 'refunded' && str_contains((string) ($markers[0]['message'] ?? ''), 'paymos_refund_wdr_605');
-echo $ok ? 'OK' : ('MARKER_FAIL:' . json_encode([$markers, Loader::$txStore[10]]));
+$ok = ($snapAfter['transaction']['status'] ?? '') === 'refunded'
+    && ($snapAfter['transaction']['id'] ?? '') === '10'
+    && count($markers) === 1
+    && ($markers[0]['status'] ?? '') === 'refunded'
+    && str_contains((string) ($markers[0]['message'] ?? ''), 'paymos_refund_wdr_605');
+echo $ok ? 'OK' : ('MARKER_FAIL:' . json_encode([$snapAfter, $markers, Loader::$txStore[10]]));
 exit($ok ? 0 : 1);
 PHP;
     $tmp = tempnam(sys_get_temp_dir(), 'blesta605_probe_');

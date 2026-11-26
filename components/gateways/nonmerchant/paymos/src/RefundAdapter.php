@@ -1266,15 +1266,35 @@ final class RefundAdapter implements NativeRefundProjectorInterface
             }
 
             $txObj = null;
-            if (method_exists($host->Transactions, 'getByReference')) {
-                $txObj = $host->Transactions->getByReference((string) $mapping['paymos_invoice_id'], (string) ($mapping['transaction_id'] ?? ''));
+            $mappingTxId = trim((string) ($mapping['transaction_id'] ?? ''));
+            $paymosInvoiceId = trim((string) ($mapping['paymos_invoice_id'] ?? ''));
+
+            if (method_exists($host->Transactions, 'getByTransactionId')) {
+                foreach (array_unique(array_filter(array($mappingTxId, $paymosInvoiceId), static fn (string $v): bool => $v !== '')) as $candidateTxId) {
+                    $found = $host->Transactions->getByTransactionId($candidateTxId, (int) $invObj->client_id);
+                    if (is_object($found)) {
+                        $txObj = $found;
+                        break;
+                    }
+                }
+            }
+            if (!is_object($txObj) && method_exists($host->Transactions, 'getByReference')) {
+                $txObj = $host->Transactions->getByReference($paymosInvoiceId, $mappingTxId);
             }
             if (!is_object($txObj) && method_exists($host->Transactions, 'getList')) {
-                $txList = $host->Transactions->getList((int) $invObj->client_id);
+                // Blesta Transactions::getList($client_id = null, $status = 'approved', ...) defaults
+                // to $status = 'approved', which hides transactions already marked 'refunded' right after
+                // Transactions::edit(). Pass null so all statuses are searched (needed by post-apply inspect()).
+                $txList = $host->Transactions->getList((int) $invObj->client_id, null);
                 if (is_array($txList)) {
                     foreach ($txList as $candidate) {
-                        if (is_object($candidate)
-                            && (string) ($candidate->reference_id ?? '') === (string) $mapping['paymos_invoice_id']) {
+                        if (!is_object($candidate)) {
+                            continue;
+                        }
+                        $candRef = trim((string) ($candidate->reference_id ?? ''));
+                        $candTx = trim((string) ($candidate->transaction_id ?? ''));
+                        if (($paymosInvoiceId !== '' && ($candRef === $paymosInvoiceId || $candTx === $paymosInvoiceId))
+                            || ($mappingTxId !== '' && $candTx === $mappingTxId)) {
                             $txObj = $candidate;
                             break;
                         }

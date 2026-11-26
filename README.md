@@ -1,8 +1,14 @@
 # Paymos for Blesta
 
+**English** | [简体中文](README.zh-CN.md) | [Русский](README.ru.md) | [Español](README.es.md) | [Deutsch](README.de.md) | [Türkçe](README.tr.md)
+
 Official Paymos non-merchant payment gateway and companion reconciliation plugin for **Blesta v5 and v6**.
 
 Accept four stablecoins (**USDT**, **USDC**, **USD1**, **DAI**) and gold-backed **XAUT** through Paymos hosted checkout, with One-Click **Connect Paymos**, AES-256-GCM encrypted credential storage, crash-safe invoice creation with line items (`products[]`), signed multi-environment webhooks, reverse verification, scheduled 24-hour invoice and refund reconciliation, and server-calculated `full` and `overpayment` refunds.
+
+[![Watch: 12 Official CMS Crypto Plugins — 1-Click Connect (Paymos)](https://i.ytimg.com/vi/VMLUGVumYkg/maxresdefault.jpg)](https://www.youtube.com/watch?v=VMLUGVumYkg)
+
+> **Video walkthrough (1:12, subtitles in 6 languages):** [Watch on YouTube](https://www.youtube.com/watch?v=VMLUGVumYkg)
 
 ## Requirements
 

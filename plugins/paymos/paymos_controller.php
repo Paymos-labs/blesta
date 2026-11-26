@@ -49,7 +49,8 @@ class PaymosController extends AppController
             && method_exists($this->structure, 'setDefaultView') && defined('APPDIR')) {
             $this->structure->setDefaultView(APPDIR);
         }
-        if (is_callable(array('parent', 'preAction'))) {
+        $parentClass = get_parent_class($this);
+        if (is_string($parentClass) && method_exists($parentClass, 'preAction')) {
             parent::preAction();
         }
         if (isset($this->view) && is_object($this->view)) {
