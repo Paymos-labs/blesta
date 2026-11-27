@@ -6,6 +6,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-11-27
+
+- chore: rebuild canonical CMS package
+
 ## [1.0.3] - 2026-11-26
 
 - fix(blesta): resolve refunded transaction lookup in post-apply snapshot (#B-6)

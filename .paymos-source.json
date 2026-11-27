@@ -1,6 +1,6 @@
 {
   "source_repository": "Paymos-labs/paymos",
   "source_path": "plugins/blesta-paymos",
-  "source_commit": "b34d7506e834e029fceb58ccc179505019a58194",
-  "version": "1.0.3"
+  "source_commit": "a1195c49b11a9f1c6a632122606b84f0333283bf",
+  "version": "1.0.4"
 }
