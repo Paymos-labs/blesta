@@ -44,6 +44,22 @@ final class CallbackProcessor
     /** @var callable|null */
     private $logger;
 
+    /**
+     * function (array $snapshot, string $title, string $body): ?bool — writes one native
+     * admin-visible Blesta note; throws on failure, returns false when it cannot be written.
+     *
+     * @var callable|null
+     */
+    private $noteWriter;
+
+    /**
+     * function (string $transactionId): ?bool — whether Blesta already stores this gateway
+     * transaction (true / false), null when it cannot tell.
+     *
+     * @var callable|null
+     */
+    private $transactionLookup;
+
     public function __construct(
         Config $config,
         SnapshotStore $snapshots,
@@ -53,7 +69,9 @@ final class CallbackProcessor
         ?callable $refundCallbackHandler = null,
         ?callable $paymentApplier = null,
         ?callable $clock = null,
-        ?callable $logger = null
+        ?callable $logger = null,
+        ?callable $noteWriter = null,
+        ?callable $transactionLookup = null
     ) {
         $this->config = $config;
         $this->snapshots = $snapshots;
@@ -66,6 +84,71 @@ final class CallbackProcessor
             return time();
         };
         $this->logger = $logger;
+        $this->noteWriter = $noteWriter;
+        $this->transactionLookup = $transactionLookup;
+    }
+
+    /**
+     * Blesta transactions are keyed by transaction_id + gateway (GatewayPayments::processNotification).
+     */
+    public static function blestaTransactionLookup(): callable
+    {
+        return static function (string $transactionId): ?bool {
+            if (trim($transactionId) === '' || !class_exists('Loader') || !method_exists('Loader', 'loadModels')) {
+                return null;
+            }
+
+            $host = new \stdClass();
+            \Loader::loadModels($host, array('Transactions', 'GatewayManager'));
+            if (!isset($host->Transactions) || !method_exists($host->Transactions, 'getByTransactionId')) {
+                return null;
+            }
+
+            $gatewayId = null;
+            if (isset($host->GatewayManager) && method_exists($host->GatewayManager, 'getByClass')) {
+                $companyId = class_exists('Configure') && method_exists('Configure', 'get')
+                    ? (int) (\Configure::get('Blesta.company_id') ?: 1)
+                    : 1;
+                $gateways = $host->GatewayManager->getByClass('paymos', $companyId);
+                if (is_array($gateways) && isset($gateways[0]->id) && is_numeric($gateways[0]->id)) {
+                    $gatewayId = (int) $gateways[0]->id;
+                }
+            }
+
+            return (bool) $host->Transactions->getByTransactionId($transactionId, null, $gatewayId);
+        };
+    }
+
+    /**
+     * Native admin-visible note for paid_late and manual review: a sticky note on the Blesta
+     * client profile (Clients::addNote), written by the system (no staff member).
+     */
+    public static function blestaClientNoteWriter(): callable
+    {
+        return static function (array $snapshot, string $title, string $body): bool {
+            $clientId = isset($snapshot['client_id']) && is_numeric($snapshot['client_id']) ? (int) $snapshot['client_id'] : 0;
+            if ($clientId <= 0 || !class_exists('Loader') || !method_exists('Loader', 'loadModels')) {
+                return false;
+            }
+
+            $host = new \stdClass();
+            \Loader::loadModels($host, array('Clients'));
+            if (!isset($host->Clients) || !is_object($host->Clients) || !method_exists($host->Clients, 'addNote')) {
+                return false;
+            }
+
+            $noteId = $host->Clients->addNote($clientId, null, array(
+                'title' => $title,
+                'description' => $body,
+                'stickied' => 1,
+            ));
+            $errors = method_exists($host->Clients, 'errors') ? $host->Clients->errors() : false;
+            if (!$noteId || !empty($errors)) {
+                throw new \RuntimeException('paymos_native_note_failed');
+            }
+
+            return true;
+        };
     }
 
     /**
@@ -83,7 +166,6 @@ final class CallbackProcessor
             : trim((string) $signatureOrHeaders);
 
         $eventId = null;
-        $refundDelivery = false;
 
         try {
             $verifier = new MultiEnvironmentWebhookVerifier($this->config->webhookSecrets(), $this->eventStore);
@@ -97,7 +179,6 @@ final class CallbackProcessor
 
             if (strncmp($event->type(), 'withdrawal.', 11) === 0
                 && (($data['type'] ?? '') === 'refund' || !empty($data['invoice_id']))) {
-                $refundDelivery = true;
                 if ($this->refundCallbackHandler === null) {
                     $this->safeRelease($eventId);
                     return $this->result(500, 'refund_handler_unavailable', 'Processing failed', false, null, $environment, 'Refund callback handler unavailable.');
@@ -129,9 +210,9 @@ final class CallbackProcessor
             $this->log('webhook.duplicate', array(), 'info');
             return $this->result(200, 'duplicate', 'OK', true, null, null, null);
         } catch (EventInProgressException $e) {
-            if ($refundDelivery && $eventId !== null) {
-                $this->safeRelease($eventId);
-            }
+            // Owner-fenced: drops only this delivery's own reservation (e.g. the payment lock was
+            // busy), never the reservation of the delivery that is still running.
+            $this->safeRelease($eventId);
             return $this->result(409, 'in_progress', 'In progress', false, null, null, $e->getMessage());
         } catch (SignatureMismatchException $e) {
             return $this->result(401, 'invalid_signature', 'Bad signature', false, null, null, $e->getMessage());
@@ -236,6 +317,32 @@ final class CallbackProcessor
             throw new \RuntimeException('Paymos invoice snapshot is still pending creation bind.');
         }
 
+        // The webhook and the cron reconciler share one lock per Paymos invoice and re-read the
+        // row under it: whoever comes second sees the payment the first one recorded.
+        return $this->snapshots->withPaymentLock(
+            (string) $snapshot['paymos_invoice_id'],
+            function () use ($event, $environment, $snapshot, $reverseVerify, $fromCron): array {
+                $fresh = $this->snapshots->findByExternalOrderId((string) $snapshot['external_order_id']);
+                if (!is_array($fresh)) {
+                    throw new \RuntimeException('Paymos Blesta invoice snapshot was not found.');
+                }
+
+                return $this->applyLocked($event, $environment, $fresh, $reverseVerify, $fromCron);
+            }
+        );
+    }
+
+    /**
+     * @param array<string, mixed> $snapshot
+     * @return array{status: string, applied: bool, transaction: ?array<string, mixed>, message: ?string}
+     */
+    private function applyLocked(
+        WebhookEvent $event,
+        string $environment,
+        array $snapshot,
+        bool $reverseVerify,
+        bool $fromCron
+    ): array {
         $this->assertSnapshotMatchesEvent($snapshot, $event, $environment);
 
         $action = StatusMapper::invoiceAction($event->type(), $event->status());
@@ -245,20 +352,26 @@ final class CallbackProcessor
             if ($reverseVerify) {
                 $this->verifyAgainstApi($event, $snapshot, $environment);
             }
-            if (!empty($snapshot['paid_late_noted'])) {
+
+            $alreadyNoted = !empty($snapshot['paid_late_noted']);
+            if (!$alreadyNoted) {
+                $marker = $event->id() !== '' ? $event->id() : '1';
+                $this->snapshots->markPaidLateNoted((string) $snapshot['external_order_id'], $marker);
+                $this->snapshots->updateMetaFlag((string) $snapshot['external_order_id'], 'paid_late_note', 'Paymos: customer paid after invoice closed. Check service status and fulfil manually or refund.');
+                $this->log('webhook.paid_late', array(
+                    'invoice_id' => $event->invoiceId(),
+                    'external_order_id' => $snapshot['external_order_id'],
+                ), 'warning');
+            }
+
+            // One native note per invoice; a failed write is retried by the next delivery or cron run.
+            $noteAdded = $this->addNativeNoteOnce($snapshot, 'paid_late', 'Paymos.note.paid_late.title', 'Paymos.note.paid_late.body');
+            if ($alreadyNoted && !$noteAdded) {
                 $this->log('webhook.paid_late_duplicate', array(
                     'invoice_id' => $event->invoiceId(),
                 ), 'info');
                 return array('status' => 'paid_late_already_noted', 'applied' => false, 'transaction' => null, 'message' => null);
             }
-
-            $marker = $event->id() !== '' ? $event->id() : '1';
-            $this->snapshots->markPaidLateNoted((string) $snapshot['external_order_id'], $marker);
-            $this->snapshots->updateMetaFlag((string) $snapshot['external_order_id'], 'paid_late_note', 'Paymos: customer paid after invoice closed. Check service status and fulfil manually or refund.');
-            $this->log('webhook.paid_late', array(
-                'invoice_id' => $event->invoiceId(),
-                'external_order_id' => $snapshot['external_order_id'],
-            ), 'warning');
 
             return array('status' => 'paid_late_noted', 'applied' => false, 'transaction' => null, 'message' => null);
         }
@@ -267,6 +380,18 @@ final class CallbackProcessor
         $recordedStatus = (string) ($snapshot['status'] ?? '');
         $rowIsFinal = StatusMapper::isFinalStatus($recordedFinal !== '' ? $recordedFinal : $recordedStatus);
         if ($rowIsFinal) {
+            $replay = $fromCron ? null : $this->replayRecordedPayment($event, $snapshot, $environment, $action, $reverseVerify);
+            if ($replay !== null) {
+                // The payment was recorded here but Blesta may not have stored its transaction
+                // (failed delivery). Blesta updates the transaction with the same transaction_id
+                // instead of adding one, and refuses to apply more than the transaction holds.
+                $this->log('webhook.payment_replayed', array(
+                    'invoice_id' => $event->invoiceId(),
+                    'transaction_id' => $replay['transaction_id'],
+                ), 'info');
+                return array('status' => $recordedFinal !== '' ? $recordedFinal : $recordedStatus, 'applied' => false, 'transaction' => $replay, 'message' => null);
+            }
+
             $this->log('webhook.stale_after_final', array(
                 'invoice_id' => $event->invoiceId(),
                 'recorded_status' => $recordedFinal !== '' ? $recordedFinal : $recordedStatus,
@@ -288,9 +413,16 @@ final class CallbackProcessor
         }
 
         // Roll-back / double-payment guard: once Blesta invoice is Paid, ignore complete-or-downgrade events.
+        // The recorded Paymos status is left as it is: writing "paid" here would make the real
+        // Paymos payment that may still arrive look like a stale event.
         if (!empty($billingState['paid']) && $this->isCompleteOrDowngrade($action)) {
-            if (!$rowIsFinal) {
-                $this->snapshots->updateStatus((string) $snapshot['paymos_invoice_id'], 'paid');
+            if ($action === StatusMapper::ACTION_PAYMENT_COMPLETE) {
+                // Money did arrive in Paymos for an invoice Blesta already closed another way.
+                $this->snapshots->updateStatus(
+                    (string) $snapshot['paymos_invoice_id'],
+                    $event->status() !== '' ? $event->status() : 'paid'
+                );
+                $this->flagManualReview($snapshot, 'blesta_invoice_already_paid', 'Paymos.note.manual_review.already_paid', $event);
             }
             $this->log('webhook.already_paid_guarded', array(
                 'invoice_id' => $event->invoiceId(),
@@ -341,12 +473,11 @@ final class CallbackProcessor
                 $event->orderAmount(),
                 $event->orderCurrency()
             );
-            $this->snapshots->updateMetaFlag((string) $snapshot['external_order_id'], 'manual_review', true);
-            $this->snapshots->updateMetaFlag((string) $snapshot['external_order_id'], 'manual_review_reason', 'amount_or_currency_mismatch');
             $this->log('webhook.manual_review', array(
                 'invoice_id' => $event->invoiceId(),
                 'summary' => $summary,
             ), 'warning');
+            $this->flagManualReview($snapshot, 'amount_or_currency_mismatch', 'Paymos.note.manual_review.amount_mismatch', $event);
             throw new \RuntimeException('Paymos payment amount or currency requires manual review.');
         }
 
@@ -354,16 +485,7 @@ final class CallbackProcessor
         $txHash = $this->extractTxHash(is_array($txSource) ? $txSource : array());
         $transactionId = $txHash !== '' ? $txHash : $event->invoiceId();
 
-        $transaction = array(
-            'client_id' => $snapshot['client_id'],
-            'amount' => (string) $snapshot['amount'],
-            'currency' => strtoupper(trim((string) $snapshot['currency'])),
-            'invoices' => isset($meta['invoices']) && is_array($meta['invoices']) ? $meta['invoices'] : array(),
-            'status' => 'approved',
-            'reference_id' => (string) $snapshot['paymos_invoice_id'],
-            'transaction_id' => $transactionId,
-            'parent_transaction_id' => null,
-        );
+        $transaction = $this->buildTransaction($snapshot, $transactionId);
 
         if ($fromCron && $this->paymentApplier !== null) {
             call_user_func($this->paymentApplier, $transaction, $snapshot, $event);
@@ -371,6 +493,10 @@ final class CallbackProcessor
 
         $finalStatus = $event->status() !== '' ? $event->status() : 'paid';
         $this->snapshots->updateStatus((string) $snapshot['paymos_invoice_id'], $finalStatus, $transactionId);
+        if ($fromCron && $this->paymentApplier !== null) {
+            // The applier confirmed Blesta holds the transaction: no later delivery replays it.
+            $this->snapshots->updateMetaFlag((string) $snapshot['external_order_id'], 'blesta_transaction_confirmed', true);
+        }
         $this->log('webhook.payment_completed', array(
             'invoice_id' => $event->invoiceId(),
             'status' => $finalStatus,
@@ -383,6 +509,140 @@ final class CallbackProcessor
             'transaction' => $transaction,
             'message' => null,
         );
+    }
+
+    /**
+     * The Blesta transaction for a recorded Paymos payment (the shape validate() returns).
+     *
+     * @param array<string, mixed> $snapshot
+     * @return array<string, mixed>
+     */
+    private function buildTransaction(array $snapshot, string $transactionId): array
+    {
+        $meta = SnapshotStore::decodeMeta(isset($snapshot['payload_meta']) ? (string) $snapshot['payload_meta'] : null);
+
+        return array(
+            'client_id' => $snapshot['client_id'],
+            'amount' => (string) $snapshot['amount'],
+            'currency' => strtoupper(trim((string) $snapshot['currency'])),
+            'invoices' => isset($meta['invoices']) && is_array($meta['invoices']) ? $meta['invoices'] : array(),
+            'status' => 'approved',
+            'reference_id' => (string) $snapshot['paymos_invoice_id'],
+            'transaction_id' => $transactionId,
+            'parent_transaction_id' => null,
+        );
+    }
+
+    /**
+     * A redelivered payment event for a payment already recorded here: hand Blesta the same
+     * transaction again so a delivery that failed after the record is not lost.
+     *
+     * @param array<string, mixed> $snapshot
+     * @return array<string, mixed>|null
+     */
+    private function replayRecordedPayment(
+        WebhookEvent $event,
+        array $snapshot,
+        string $environment,
+        string $action,
+        bool $reverseVerify
+    ): ?array {
+        $recorded = strtolower(trim((string) ($snapshot['final_status'] ?? $snapshot['status'] ?? '')));
+        $transactionId = trim((string) ($snapshot['transaction_id'] ?? ''));
+        $meta = SnapshotStore::decodeMeta(isset($snapshot['payload_meta']) ? (string) $snapshot['payload_meta'] : null);
+        if ($action !== StatusMapper::ACTION_PAYMENT_COMPLETE
+            || !in_array($recorded, array('paid', 'paid_over'), true)
+            || strtolower(trim($event->status())) !== $recorded
+            || $transactionId === ''
+            || !empty($meta['blesta_transaction_confirmed'])
+            || $this->transactionLookup === null) {
+            return null;
+        }
+
+        // Replay only what Blesta does not hold: a transaction it knows (possibly refunded or
+        // voided by the admin since) must not be overwritten, and its payment email not re-sent.
+        $known = call_user_func($this->transactionLookup, $transactionId);
+        if ($known === true) {
+            $this->snapshots->updateMetaFlag((string) $snapshot['external_order_id'], 'blesta_transaction_confirmed', true);
+            return null;
+        }
+        if ($known !== false) {
+            return null;
+        }
+
+        if ($reverseVerify) {
+            $this->verifyAgainstApi($event, $snapshot, $environment);
+        }
+
+        return $this->buildTransaction($snapshot, $transactionId);
+    }
+
+    /**
+     * Mark the payment for manual review and leave the admin one native note about it.
+     *
+     * @param array<string, mixed> $snapshot
+     */
+    private function flagManualReview(array $snapshot, string $reason, string $bodyKey, WebhookEvent $event): void
+    {
+        $externalOrderId = (string) $snapshot['external_order_id'];
+        $this->snapshots->updateMetaFlag($externalOrderId, 'manual_review', true);
+        $this->snapshots->updateMetaFlag($externalOrderId, 'manual_review_reason', $reason);
+
+        try {
+            $this->addNativeNoteOnce($snapshot, 'manual_review', 'Paymos.note.manual_review.title', $bodyKey, array(
+                '{amount}' => $event->orderAmount() !== '' ? $event->orderAmount() : (string) $snapshot['amount'],
+                '{currency}' => $event->orderCurrency() !== '' ? $event->orderCurrency() : (string) $snapshot['currency'],
+            ));
+        } catch (\Throwable $e) {
+            $this->log('webhook.native_note_failed', array(
+                'invoice_id' => (string) $snapshot['paymos_invoice_id'],
+                'error' => $this->config->sanitize($e->getMessage()),
+            ), 'warning');
+        }
+    }
+
+    /**
+     * Write one native Blesta note of $kind for this payment (idempotent via payload_meta).
+     *
+     * @param array<string, mixed> $snapshot
+     * @param array<string, string> $vars
+     * @return bool true when a note was written now
+     */
+    private function addNativeNoteOnce(array $snapshot, string $kind, string $titleKey, string $bodyKey, array $vars = array()): bool
+    {
+        if ($this->noteWriter === null) {
+            return false;
+        }
+
+        $externalOrderId = (string) $snapshot['external_order_id'];
+        $fresh = $this->snapshots->findByExternalOrderId($externalOrderId);
+        $current = is_array($fresh) ? $fresh : $snapshot;
+        $meta = SnapshotStore::decodeMeta(isset($current['payload_meta']) ? (string) $current['payload_meta'] : null);
+        $flag = 'native_note_' . $kind;
+        if (!empty($meta[$flag])) {
+            return false;
+        }
+
+        $locale = Translation::detectLocale();
+        $vars = array_merge(array(
+            '{paymos_invoice_id}' => (string) $current['paymos_invoice_id'],
+            '{amount}' => (string) $current['amount'],
+            '{currency}' => (string) $current['currency'],
+        ), $vars);
+        $title = strtr(Translation::text($titleKey, $locale), $vars);
+        $body = strtr(Translation::text($bodyKey, $locale), $vars);
+
+        if (call_user_func($this->noteWriter, $current, $title, $body) === false) {
+            return false;
+        }
+
+        $this->snapshots->updateMetaFlag($externalOrderId, $flag, $this->now());
+        $this->log('webhook.native_note', array(
+            'invoice_id' => (string) $current['paymos_invoice_id'],
+            'kind' => $kind,
+        ), 'info');
+
+        return true;
     }
 
     /**

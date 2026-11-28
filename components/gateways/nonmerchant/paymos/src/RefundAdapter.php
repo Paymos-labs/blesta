@@ -126,17 +126,26 @@ final class RefundAdapter implements NativeRefundProjectorInterface
             throw new \RuntimeException('refund_mode_invalid');
         }
 
-        return $this->store->withPaymentLock($paymentKey, function () use ($input, $paymentKey, $token, $mode): RefundIntent {
+        // A refund belongs to one Paymos payment; the Blesta invoice only finds it.
+        $payment = $this->resolvePayment(
+            (int) $paymentKey,
+            isset($input['paymos_invoice_id']) && is_string($input['paymos_invoice_id']) ? trim($input['paymos_invoice_id']) : ''
+        );
+        $paymosInvoiceId = $payment !== null ? (string) $payment['paymos_invoice_id'] : null;
+        $paymentKey = $payment !== null ? (string) $this->paymentKeyOf($payment, (int) $paymentKey) : $paymentKey;
+
+        return $this->store->withPaymentLock($paymentKey, function () use ($input, $paymentKey, $paymosInvoiceId, $token, $mode): RefundIntent {
             $installation = $this->store->installationId();
             $existing = $this->store->findByRequestToken($installation, $token);
             if ($existing !== null) {
-                if ($existing->paymentKey() !== $paymentKey || $existing->mode() !== $mode) {
+                if ($existing->paymentKey() !== $paymentKey || $existing->mode() !== $mode
+                    || ($paymosInvoiceId !== null && $existing->invoiceId() !== $paymosInvoiceId)) {
                     throw new \RuntimeException('refund_request_conflict');
                 }
                 $this->assertRequestMatchesDraft($input, $existing->fullDraft());
                 $intent = $existing;
             } else {
-                $snapshot = $this->loadNativeSnapshot((int) $paymentKey);
+                $snapshot = $this->loadNativeSnapshot((int) $paymentKey, $paymosInvoiceId);
                 $this->assertOriginalPaid($snapshot);
                 $draft = $mode === RefundStates::FULL ? $this->buildFullDraft($snapshot) : null;
                 $this->assertRequestMatchesDraft($input, $draft);
@@ -191,15 +200,25 @@ final class RefundAdapter implements NativeRefundProjectorInterface
         $this->lastNativeMessage = '';
 
         try {
-            $invoiceId = $this->resolveNativeInvoiceId($params);
+            // Blesta hands over the refunded transaction: reference_id is its Paymos invoice.
+            $payment = $this->findNativePaymentSnapshot($params);
+            if ($payment === null && isset($params['invoice_id']) && is_numeric($params['invoice_id']) && (int) $params['invoice_id'] > 0) {
+                $payment = $this->resolvePayment((int) $params['invoice_id'], '');
+            }
+            $invoiceId = $payment !== null ? $this->blestaInvoiceIdFromSnapshot($payment) : 0;
             if ($invoiceId <= 0) {
-                $this->lastNativeMessage = Translation::text('Paymos.!error.refund.failed', $locale);
+                // A payment that only added account credit has no Blesta invoice to refund against.
+                $this->lastNativeMessage = $payment !== null && count(SnapshotStore::invoiceIds($payment)) === 0
+                    ? Translation::text('Paymos.!error.refund.credit_unsupported', $locale)
+                    : Translation::text('Paymos.!error.refund.failed', $locale);
                 return null;
             }
 
-            $token = $this->resolveNativeRequestToken($params, $invoiceId);
+            $paymosInvoiceId = (string) $payment['paymos_invoice_id'];
+            $token = $this->resolveNativeRequestToken($params, $invoiceId, $paymosInvoiceId);
             $input = array(
                 'invoice_id' => (string) $invoiceId,
+                'paymos_invoice_id' => $paymosInvoiceId,
                 'mode' => RefundStates::FULL,
                 'request_token' => $token,
             );
@@ -264,7 +283,7 @@ final class RefundAdapter implements NativeRefundProjectorInterface
     public function preflight(RefundIntent $intent): ?string
     {
         try {
-            $snapshot = $this->loadNativeSnapshot((int) $intent->paymentKey());
+            $snapshot = $this->loadNativeSnapshot((int) $intent->paymentKey(), $intent->invoiceId());
             $this->assertMapping($snapshot, $intent);
             $this->assertOriginalPaid($snapshot);
 
@@ -282,6 +301,9 @@ final class RefundAdapter implements NativeRefundProjectorInterface
             }
 
             foreach ($this->store->externalForPayment($intent->paymentKey()) as $external) {
+                if (($external['observation']['invoice_id'] ?? $intent->invoiceId()) !== $intent->invoiceId()) {
+                    continue;
+                }
                 if (($external['review_reason'] ?? null) !== null
                     || (($external['observation']['mode'] ?? '') === RefundStates::FULL
                         && ($external['observation']['status'] ?? '') === 'completed')) {
@@ -329,7 +351,7 @@ final class RefundAdapter implements NativeRefundProjectorInterface
     {
         $intent = $this->store->getIntent($operationId);
         try {
-            $snapshot = $this->loadNativeSnapshot((int) $intent->paymentKey());
+            $snapshot = $this->loadNativeSnapshot((int) $intent->paymentKey(), $intent->invoiceId());
             $this->assertMapping($snapshot, $intent);
         } catch (\Throwable $error) {
             return $this->ambiguous($intent, $error->getMessage());
@@ -622,30 +644,97 @@ final class RefundAdapter implements NativeRefundProjectorInterface
     {
         $this->enforceAuthorization(false);
 
-        $id = (int) $invoiceId;
-        if ($id <= 0) {
+        $requestedId = (int) $invoiceId;
+        if ($requestedId <= 0) {
             throw new \InvalidArgumentException('refund_payment_key_invalid');
         }
 
-        $paymentKey = (string) $id;
         $normalizedLocale = Translation::normalizeLocale($locale);
         $sdkLocale = Translation::sdkLocale($normalizedLocale);
 
-        // Best-effort discovery and reconciliation before computing available actions.
-        $paidSnapshot = $this->snapshots->findPaidByBlestaInvoiceId($id)
-            ?: $this->snapshots->findLatestByBlestaInvoiceId($id);
-        if (is_array($paidSnapshot) && isset($paidSnapshot['environment']) && is_string($paidSnapshot['environment'])) {
+        // Every Paymos payment of the invoice is refunded on its own (part payments, a payment
+        // of several invoices); newest first.
+        $payments = $this->snapshots->findPaidPaymentsForBlestaInvoice($requestedId);
+
+        // Best-effort discovery before computing available actions, once per payment key.
+        $discovery = array();
+        foreach ($payments as $payment) {
+            $discovery[(string) $payment['environment'] . '|' . $this->paymentKeyOf($payment, $requestedId)] = true;
+        }
+        if (count($payments) === 0) {
+            $latest = $this->snapshots->findLatestByBlestaInvoiceId($requestedId);
+            if (is_array($latest) && isset($latest['environment']) && is_string($latest['environment'])) {
+                $discovery[$latest['environment'] . '|' . $requestedId] = true;
+            }
+        }
+        foreach (array_keys($discovery) as $scope) {
+            list($environment, $key) = explode('|', $scope, 2);
             try {
-                $this->discoverExternal($paidSnapshot['environment'], $id);
+                $this->discoverExternal($environment, (int) $key);
             } catch (\Throwable $e) {
                 $this->log('refund.panel_discovery_failed', array(
-                    'invoice_id' => $id,
+                    'invoice_id' => (int) $key,
                     'error' => $this->config->sanitize($e->getMessage()),
                 ), 'warning');
             }
         }
 
-        foreach ($this->store->forPayment($paymentKey) as $intent) {
+        $sections = array();
+        foreach ($payments as $payment) {
+            $sections[] = $this->paymentSection($this->paymentKeyOf($payment, $requestedId), (string) $payment['paymos_invoice_id'], $sdkLocale);
+        }
+        if (count($sections) === 0) {
+            $sections[] = $this->paymentSection($requestedId, null, $sdkLocale);
+        }
+
+        $html = '';
+        foreach ($sections as $section) {
+            $heading = count($sections) > 1 && $section['paymos_invoice_id'] !== null
+                ? strtr(Translation::text('Paymos.refunds.payment_label', $normalizedLocale), array(
+                    '{paymos_invoice_id}' => (string) $section['paymos_invoice_id'],
+                    '{amount}' => (string) $section['amount'],
+                    '{currency}' => (string) $section['currency'],
+                ))
+                : null;
+            $html .= $this->renderPanelHtml(
+                $section['invoice_id'],
+                $normalizedLocale,
+                $section['intents'],
+                $section['external_refunds'],
+                $section['can_refund_full'],
+                $section['can_refund_overpayment'],
+                $section['tokens'],
+                $section['paymos_invoice_id'],
+                $heading
+            );
+        }
+
+        $primary = $sections[0];
+        return array(
+            'invoice_id' => $primary['invoice_id'],
+            'paymos_invoice_id' => $primary['paymos_invoice_id'],
+            'environment' => $primary['environment'],
+            'can_refund_full' => $primary['can_refund_full'],
+            'can_refund_overpayment' => $primary['can_refund_overpayment'],
+            'tokens' => $primary['tokens'],
+            'intents' => $primary['intents'],
+            'external_refunds' => $primary['external_refunds'],
+            'payments' => $sections,
+            'copy' => RefundCopy::labels($sdkLocale),
+            'html' => $html,
+        );
+    }
+
+    /**
+     * Refund state of one Paymos payment (or, with $paymosInvoiceId null, of the key as a whole).
+     *
+     * @return array<string, mixed>
+     */
+    private function paymentSection(int $id, ?string $paymosInvoiceId, string $sdkLocale): array
+    {
+        $paymentKey = (string) $id;
+
+        foreach ($this->intentsOf($paymentKey, $paymosInvoiceId) as $intent) {
             if (!in_array($intent->cashState(), array(RefundStates::COMPLETED, RefundStates::FAILED, RefundStates::CANCELLED), true)
                 || ($intent->cashState() === RefundStates::COMPLETED && $intent->projectionState() !== RefundStates::PROJECTION_APPLIED)) {
                 try {
@@ -668,7 +757,7 @@ final class RefundAdapter implements NativeRefundProjectorInterface
         $hasCompletedOverpayment = false;
         $intentItems = array();
 
-        foreach ($this->store->forPayment($paymentKey) as $intent) {
+        foreach ($this->intentsOf($paymentKey, $paymosInvoiceId) as $intent) {
             if ($this->store->blocksNewIntent($intent)) {
                 $hasBlocking = true;
                 $tokens[$intent->mode()] = $intent->toArray()['request_token'];
@@ -702,6 +791,9 @@ final class RefundAdapter implements NativeRefundProjectorInterface
         $externalItems = array();
         foreach ($this->store->externalForPayment($paymentKey) as $ext) {
             $obs = isset($ext['observation']) && is_array($ext['observation']) ? $ext['observation'] : array();
+            if ($paymosInvoiceId !== null && (string) ($obs['invoice_id'] ?? $paymosInvoiceId) !== $paymosInvoiceId) {
+                continue;
+            }
             $extMode = (string) ($obs['mode'] ?? '');
             $extStatus = (string) ($obs['status'] ?? '');
             if ($extMode === RefundStates::FULL && $extStatus === 'completed') {
@@ -728,14 +820,17 @@ final class RefundAdapter implements NativeRefundProjectorInterface
         $canRefundFull = false;
         $canRefundOverpayment = false;
         $environment = null;
-        $paymosInvoiceId = null;
+        $amount = null;
+        $currency = null;
 
         try {
-            $nativeSnap = $this->loadNativeSnapshot($id);
+            $nativeSnap = $this->loadNativeSnapshot($id, $paymosInvoiceId);
             $this->assertOriginalPaid($nativeSnap);
             $mapping = $nativeSnap['mapping'];
             $environment = (string) $mapping['environment'];
             $paymosInvoiceId = (string) $mapping['paymos_invoice_id'];
+            $amount = (string) $mapping['amount'];
+            $currency = (string) $mapping['currency'];
             $refundConfig = $this->credentialStore->refundConfig($environment);
             $capable = in_array('invoice_refunds_v1', $refundConfig['capabilities'], true)
                 && $refundConfig['refund_contract_version'] === 1
@@ -753,27 +848,17 @@ final class RefundAdapter implements NativeRefundProjectorInterface
             $canRefundOverpayment = false;
         }
 
-        $html = $this->renderPanelHtml(
-            $id,
-            $normalizedLocale,
-            $intentItems,
-            $externalItems,
-            $canRefundFull,
-            $canRefundOverpayment,
-            $tokens
-        );
-
         return array(
             'invoice_id' => $id,
             'paymos_invoice_id' => $paymosInvoiceId,
             'environment' => $environment,
+            'amount' => $amount,
+            'currency' => $currency,
             'can_refund_full' => $canRefundFull,
             'can_refund_overpayment' => $canRefundOverpayment,
             'tokens' => $tokens,
             'intents' => $intentItems,
             'external_refunds' => $externalItems,
-            'copy' => RefundCopy::labels($sdkLocale),
-            'html' => $html,
         );
     }
 
@@ -874,7 +959,7 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                     $row['note_id'] = 'paymos_overpayment_' . $verified->withdrawalId();
                     $row['review_reason'] = null;
                 } elseif ($verified->mode() === RefundStates::FULL) {
-                    $nativeSnap = $this->loadNativeSnapshot($blestaInvoiceId);
+                    $nativeSnap = $this->loadNativeSnapshot($blestaInvoiceId, $verified->invoiceId());
                     $markerTag = 'paymos_refund_' . $verified->withdrawalId();
                     $existingMarkers = $this->findNativeMarkersByWithdrawal($nativeSnap, $verified->withdrawalId());
                     if (count($existingMarkers) > 1) {
@@ -935,7 +1020,7 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                                 || (($editResult['ok'] ?? true) === false)
                                 || !empty($editResult['errors']);
 
-                            $postSnap = $this->loadNativeSnapshot($blestaInvoiceId);
+                            $postSnap = $this->loadNativeSnapshot($blestaInvoiceId, $verified->invoiceId());
                             $postMarkers = $this->findNativeMarkersByWithdrawal($postSnap, $verified->withdrawalId());
                             if (!$editFailed
                                 && count($postMarkers) === 1
@@ -1117,13 +1202,10 @@ final class RefundAdapter implements NativeRefundProjectorInterface
 
     /**
      * @param array<string, mixed> $params
+     * @return array<string, mixed>|null
      */
-    private function resolveNativeInvoiceId(array $params): int
+    private function findNativePaymentSnapshot(array $params): ?array
     {
-        if (isset($params['invoice_id']) && is_numeric($params['invoice_id']) && (int) $params['invoice_id'] > 0) {
-            return (int) $params['invoice_id'];
-        }
-
         $snapshot = null;
         if (isset($params['reference_id']) && is_scalar($params['reference_id']) && trim((string) $params['reference_id']) !== '') {
             $snapshot = $this->snapshots->findByInvoiceId(trim((string) $params['reference_id']));
@@ -1132,13 +1214,68 @@ final class RefundAdapter implements NativeRefundProjectorInterface
             $snapshot = $this->snapshots->findByTransactionId(trim((string) $params['transaction_id']));
         }
 
-        return is_array($snapshot) ? $this->blestaInvoiceIdFromSnapshot($snapshot) : 0;
+        return $snapshot;
+    }
+
+    /**
+     * The Paymos payment a refund of Blesta invoice $blestaInvoiceId is for. One invoice may
+     * hold several payments (part payments, a payment of several invoices): the caller names
+     * the payment, or the invoice must have exactly one. Null when the invoice has none.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function resolvePayment(int $blestaInvoiceId, string $paymosInvoiceId): ?array
+    {
+        if ($paymosInvoiceId !== '') {
+            $payment = $this->snapshots->findByInvoiceId($paymosInvoiceId);
+            if (!is_array($payment)
+                || !in_array(strtolower((string) ($payment['final_status'] ?? $payment['status'] ?? '')), array('paid', 'paid_over'), true)
+                || !in_array($blestaInvoiceId, SnapshotStore::invoiceIds($payment), true)) {
+                throw new \RuntimeException('refund_payment_mapping_conflict');
+            }
+            return $payment;
+        }
+
+        $payments = $this->snapshots->findPaidPaymentsForBlestaInvoice($blestaInvoiceId);
+        if (count($payments) > 1) {
+            throw new \RuntimeException('refund_payment_selection_required');
+        }
+
+        return count($payments) === 1 ? $payments[0] : null;
+    }
+
+    /**
+     * Refund intents of a payment are grouped (and locked) under the first Blesta invoice the
+     * payment closed; each intent still names its own Paymos invoice.
+     *
+     * @param array<string, mixed> $payment
+     */
+    private function paymentKeyOf(array $payment, int $fallback): int
+    {
+        $ids = SnapshotStore::invoiceIds($payment);
+        return count($ids) > 0 ? $ids[0] : $fallback;
+    }
+
+    /**
+     * Intents of one Paymos payment (all intents of the key when the payment is unknown).
+     *
+     * @return array<int, RefundIntent>
+     */
+    private function intentsOf(string $paymentKey, ?string $paymosInvoiceId): array
+    {
+        $result = array();
+        foreach ($this->store->forPayment($paymentKey) as $intent) {
+            if ($paymosInvoiceId === null || $intent->invoiceId() === $paymosInvoiceId) {
+                $result[] = $intent;
+            }
+        }
+        return $result;
     }
 
     /**
      * @param array<string, mixed> $params
      */
-    private function resolveNativeRequestToken(array $params, int $invoiceId): string
+    private function resolveNativeRequestToken(array $params, int $invoiceId, string $paymosInvoiceId): string
     {
         if (isset($params['request_token']) && is_string($params['request_token']) && self::isValidUuidV4($params['request_token'])) {
             return strtolower(trim($params['request_token']));
@@ -1147,14 +1284,26 @@ final class RefundAdapter implements NativeRefundProjectorInterface
             return strtolower(trim($_POST['paymos_refund_token']));
         }
 
-        foreach ($this->store->forPayment((string) $invoiceId) as $intent) {
-            if ($intent->mode() === RefundStates::FULL && $this->store->blocksNewIntent($intent)) {
+        $endedUnrefunded = 0;
+        foreach ($this->intentsOf((string) $invoiceId, $paymosInvoiceId) as $intent) {
+            if ($intent->mode() !== RefundStates::FULL) {
+                continue;
+            }
+            if ($this->store->blocksNewIntent($intent)) {
                 return (string) $intent->toArray()['request_token'];
+            }
+            if (in_array($intent->cashState(), array(RefundStates::FAILED, RefundStates::CANCELLED), true)) {
+                $endedUnrefunded++;
             }
         }
 
-        // Deterministic UUIDv4-formatted durable token for native gateway button retries.
-        $hash = hash('sha256', $this->store->installationId() . '|blesta|native_full|' . $invoiceId);
+        // Deterministic UUIDv4-formatted durable token for native gateway button retries: a repeated
+        // press reuses it, while each failed or cancelled refund moves the next press to a new token.
+        $seed = $this->store->installationId() . '|blesta|native_full|' . $invoiceId . '|' . $paymosInvoiceId;
+        if ($endedUnrefunded > 0) {
+            $seed .= '|' . $endedUnrefunded;
+        }
+        $hash = hash('sha256', $seed);
         return sprintf(
             '%s-%s-4%s-%s%s-%s',
             substr($hash, 0, 8),
@@ -1191,9 +1340,21 @@ final class RefundAdapter implements NativeRefundProjectorInterface
     /**
      * @return array<string, mixed>
      */
-    private function loadNativeSnapshot(int $invoiceId): array
+    /**
+     * Blesta state of one Paymos payment: the invoice the refund is keyed by, the payment's
+     * snapshot (mapping) and its Blesta transaction. Without $paymosInvoiceId the latest
+     * payment of the invoice is used (one-payment invoices, legacy callers).
+     *
+     * @return array<string, mixed>
+     */
+    private function loadNativeSnapshot(int $invoiceId, ?string $paymosInvoiceId = null): array
     {
-        return $this->callNative('snapshot', array('invoice_id' => $invoiceId));
+        $input = array('invoice_id' => $invoiceId);
+        if ($paymosInvoiceId !== null && $paymosInvoiceId !== '') {
+            $input['paymos_invoice_id'] = $paymosInvoiceId;
+        }
+
+        return $this->callNative('snapshot', $input);
     }
 
     /**
@@ -1244,8 +1405,16 @@ final class RefundAdapter implements NativeRefundProjectorInterface
 
         if ($command === 'snapshot') {
             $invoiceId = (int) $input['invoice_id'];
-            $mapping = $this->snapshots->findPaidByBlestaInvoiceId($invoiceId)
-                ?: $this->snapshots->findLatestByBlestaInvoiceId($invoiceId);
+            $paymosInvoiceId = isset($input['paymos_invoice_id']) ? trim((string) $input['paymos_invoice_id']) : '';
+            if ($paymosInvoiceId !== '') {
+                $mapping = $this->snapshots->findByInvoiceId($paymosInvoiceId);
+                if ($mapping !== null && !in_array($invoiceId, SnapshotStore::invoiceIds($mapping), true)) {
+                    $mapping = null;
+                }
+            } else {
+                $mapping = $this->snapshots->findPaidByBlestaInvoiceId($invoiceId)
+                    ?: $this->snapshots->findLatestByBlestaInvoiceId($invoiceId);
+            }
             if ($mapping === null) {
                 throw new \RuntimeException('refund_payment_mapping_missing');
             }
@@ -1414,14 +1583,20 @@ final class RefundAdapter implements NativeRefundProjectorInterface
         array $externalRefunds,
         bool $canRefundFull,
         bool $canRefundOverpayment,
-        array $tokens
+        array $tokens,
+        ?string $paymosInvoiceId = null,
+        ?string $heading = null
     ): string {
         $e = static function (string $value): string {
             return htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
         };
 
-        $html = '<div id="paymos-refunds" class="paymos-refunds-panel" data-invoice-id="' . $invoiceId . '">';
+        $html = '<div class="paymos-refunds-panel" data-invoice-id="' . $invoiceId . '"'
+            . ($paymosInvoiceId !== null ? ' data-paymos-invoice-id="' . $e($paymosInvoiceId) . '"' : '') . '>';
         $html .= '<h4>' . $e(Translation::text('Paymos.refunds.title', $locale)) . '</h4>';
+        if ($heading !== null) {
+            $html .= '<p class="paymos-refund-payment">' . $e($heading) . '</p>';
+        }
 
         if (count($intents) === 0 && count($externalRefunds) === 0) {
             $html .= '<p class="paymos-refunds-empty">' . $e(Translation::text('Paymos.refunds.empty', $locale)) . '</p>';

@@ -286,6 +286,25 @@ final class Config
         return filter_var($url, FILTER_VALIDATE_URL) !== false;
     }
 
+    /**
+     * Admin-portal URI of a path, the way Blesta builds its own admin links:
+     * WEBDIR (the install subfolder, with "index.php/" when mod_rewrite is off) + Route.admin.
+     */
+    public static function adminUri(string $path, ?string $webDir): string
+    {
+        $adminRoute = 'admin';
+        if (class_exists('Configure') && method_exists('Configure', 'get')) {
+            $configured = \Configure::get('Route.admin');
+            if (is_scalar($configured) && trim((string) $configured, " \t/") !== '') {
+                $adminRoute = trim((string) $configured, " \t/");
+            }
+        }
+
+        $base = rtrim($webDir !== null && trim($webDir) !== '' ? trim($webDir) : '/', '/');
+
+        return $base . '/' . $adminRoute . '/' . ltrim($path, '/');
+    }
+
     private function resolveEnvironment(?string $environment): string
     {
         $env = $environment === null ? $this->mode : $this->normalizeEnvironment($environment);

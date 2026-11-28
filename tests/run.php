@@ -10,7 +10,7 @@ declare(strict_types=1);
  * - ConnectHandler & AdminConnect (One-Click Connect, HTTPS/binding checks, auth+CSRF, 0 manual secrets)
  * - CheckoutService (STATUS_CREATING, crash recovery, products[], InvoiceReplacement, paid_late_noted, RFC 9457)
  * - CallbackProcessor (MultiEnvironmentWebhookVerifier, dual-v1=, 401/409/200/400, withdrawal.*, reverse-verify, AmountGuard, rollback, paid_late)
- * - Reconciler & PaymosPlugin companion (24h sweep, 600s throttle, Appcontroller.structure, cron())
+ * - Reconciler & PaymosPlugin companion (24h sweep, 600s throttle, cron())
  * - RefundIntentStore & RefundAdapter & AdminRefunds (full + overpayment, nativeRefund() async-safe null, applyCompleted(), RefundDiscovery, rejects)
  * - 6 native locales parity, ISO 4217 config.json, zero-leak docs, and php -l syntax lint
  */
@@ -352,8 +352,50 @@ if (!class_exists('AppController', false)) {
         /** @var object|null */
         public $structure;
 
+        /** @var string|null */
+        public $plugin;
+
+        /** @var string|null */
+        public $controller;
+
+        /** @var string|null */
+        public $base_uri;
+
+        /** @var string|null */
+        public $action;
+
+        /** @var int */
+        public $requireLoginCalls = 0;
+
+        /**
+         * ACO aliases (plugin.controller) the logged-in staff group is NOT allowed to reach.
+         *
+         * @var array<int, string>
+         */
+        public static $deniedAcos = array();
+
+        /**
+         * Optional ACL emulation: function (string $aco): bool — true when the staff group may enter.
+         *
+         * @var callable|null
+         */
+        public static $aclCheck = null;
+
         public function preAction(): void
         {
+        }
+
+        /**
+         * Blesta AppController::requireLogin(): staff login + ACL on plugin.controller.
+         */
+        public function requireLogin($redirect_to = null): void
+        {
+            $this->requireLoginCalls++;
+            $aco = ($this->plugin ? $this->plugin . '.' : '') . (string) $this->controller;
+            if (in_array($aco, self::$deniedAcos, true)
+                || (self::$aclCheck !== null && call_user_func(self::$aclCheck, $aco) !== true)) {
+                throw new \RuntimeException('blesta_acl_denied:' . $aco);
+            }
         }
     }
 }
@@ -391,6 +433,7 @@ use PaymosBlesta\Reconciler;
 use PaymosBlesta\RefundAdapter;
 use PaymosBlesta\RefundIntentStore;
 use PaymosBlesta\SnapshotStore;
+use PaymosBlesta\StaffPermissions;
 use PaymosBlesta\Translation;
 
 // ── InMemoryDbDriver (Full SQL + Transactions + Advisory Locks) ─────────────
@@ -1194,12 +1237,18 @@ runTest('3.3 Checkout InvoiceReplacement blocks open/paid/404 and replaces only 
     $co404 = new CheckoutService($config, $snapshots, static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $notFoundTransport));
     assertThrows(InvoiceReplacementBlockedException::class, static fn () => $co404->createCheckout('10', '55.00', 'USD', array(array('id' => 302, 'amount' => '55.00'))));
 
-    // Case C: Old invoice paid -> blocked!
+    // Case C: Old invoice paid -> never reused or cancelled; the amount Blesta still asks for gets a new attempt (CMSP-08).
     $seed(303, 'inv_paid_303', 'paid');
-    $coPaid = new CheckoutService($config, $snapshots, static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), new MockTransport(array())));
-    assertThrows(InvoiceReplacementBlockedException::class, static fn () => $coPaid->createCheckout('10', '55.00', 'USD', array(array('id' => 303, 'amount' => '55.00'))));
+    $paidTransport = new MockTransport(array(
+        jsonResponse(201, array('invoice_id' => 'inv_next_303', 'payment_url' => 'https://checkout.paymos.io/inv/inv_next_303', 'status' => 'awaiting_client')),
+    ));
+    $coNext = new CheckoutService($config, $snapshots, static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $paidTransport));
+    $next = $coNext->createCheckout('10', '55.00', 'USD', array(array('id' => 303, 'amount' => '55.00')));
+    assertSame('blesta_inv_303_r1', $next['external_order_id']);
+    assertSame(1, count($paidTransport->requests()), 'Only the new create is sent; the paid invoice is left alone.');
 
     // Case D: paid_late_noted -> blocked!
+    $coPaid = new CheckoutService($config, $snapshots, static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), new MockTransport(array())));
     $seed(304, 'inv_late_304', 'expired', 'evt_late_1');
     assertThrows(InvoiceReplacementBlockedException::class, static fn () => $coPaid->createCheckout('10', '49.90', 'USD', array(array('id' => 304, 'amount' => '49.90'))));
 
@@ -1422,7 +1471,7 @@ runTest('4.2 Webhook holds manual_review on amount mismatch (400+release), guard
     $res411 = $procPaid->handle($body411, signWebhook($body411, 'whsec_sandbox_blesta_secret_001', $now));
     assertSame(200, $res411['http_status']);
     assertSame('ignored_already_paid', $res411['status']);
-    assertSame('paid', $snapshots->findByInvoiceId('inv_sbx_411')['status']);
+    assertSame('confirming', $snapshots->findByInvoiceId('inv_sbx_411')['status'], 'The guard keeps the recorded Paymos status (CMSP-11).');
 
     // Snapshot 412: invoice.paid_late on expired invoice -> note-only, paid_late_noted set, NO payment transaction
     $snapshots->save(array(
@@ -1560,18 +1609,6 @@ runTest('5.1 Reconciler sweeps missed 24h unpaid invoices, applies payment, and 
     assertSame(true, $run3['reconcile']['ran']);
     assertSame(0, $run3['reconcile']['applied']);
     assertSame(1, count($appliedTx));
-
-    // Appcontroller.structure hook injects admin helper only in admin portal
-    $events = $plugin->getEvents();
-    assertSame('Appcontroller.structure', $events[0]['event']);
-    $adminEvent = new class {
-        public $ret = array();
-        public function getParams(): array { return array('portal' => 'admin', 'controller' => 'admin_billing'); }
-        public function getReturnValue(): array { return $this->ret; }
-        public function setReturnValue(array $v): void { $this->ret = $v; }
-    };
-    $plugin->injectAdminHelpers($adminEvent);
-    assertTrue(isset($adminEvent->ret['head'][0]) && strpos($adminEvent->ret['head'][0], 'admin_refunds') !== false);
 });
 
 runTest('5.2 R1/R8: PaymosPlugin::cron() uses live Invoices/GatewayManager models without test resolver & Reconciler enforces is_test + non-empty fields', function () {
@@ -2796,6 +2833,1581 @@ PHP;
     @unlink($tmp);
     assertSame(0, $code, 'Blesta 6.0.5 subprocess probe failed: ' . implode("\n", $out));
     assertSame('OK', trim(implode('', $out)));
+});
+
+// ── Group 8: Audit fixes 2026-11-28 (CMSP-05..18, 33..37) ───────────────────
+
+final class FakeCronTasks
+{
+    /** @var array<int, object> */
+    public $tasks = array();
+    /** @var array<int, array<string, mixed>> */
+    public $runs = array();
+    /** @var array<int, array<string, mixed>> */
+    public $addCalls = array();
+    /** @var array<int, array<int, mixed>> */
+    public $runCalls = array();
+    /** @var array<int, int> */
+    public $deletedRuns = array();
+    /** @var array<int, array<int, mixed>> */
+    public $deletedTasks = array();
+    /** @var array<int, array<int, mixed>> */
+    public $edits = array();
+    /** @var mixed */
+    public $errors = null;
+    /** @var bool */
+    public $failAdd = false;
+    /** @var int */
+    private $nextTask = 100;
+    /** @var int */
+    private $nextRun = 500;
+
+    /** @return int|null */
+    public function add(array $vars)
+    {
+        $this->addCalls[] = $vars;
+        $this->errors = null;
+        if ($this->failAdd || empty($vars['key']) || empty($vars['name'])
+            || !in_array($vars['task_type'] ?? '', array('plugin', 'module', 'system'), true)) {
+            $this->errors = array('key' => array('invalid' => 'Cron task is invalid.'));
+            return null;
+        }
+        if ($this->getByKey($vars['key'], $vars['dir'] ?? null, $vars['task_type']) !== false) {
+            $this->errors = array('key' => array('unique' => 'Cron task key already exists.'));
+            return null;
+        }
+        $id = $this->nextTask++;
+        $this->tasks[$id] = (object) array(
+            'id' => $id,
+            'key' => $vars['key'],
+            'task_type' => $vars['task_type'],
+            'dir' => $vars['dir'] ?? null,
+            'name' => $vars['name'],
+            'description' => $vars['description'] ?? '',
+            'is_lang' => (string) ($vars['is_lang'] ?? '0'),
+            'type' => $vars['type'] ?? 'interval',
+        );
+        return $id;
+    }
+
+    public function seedLegacyTask(): int
+    {
+        $id = $this->nextTask++;
+        $this->tasks[$id] = (object) array(
+            'id' => $id,
+            'key' => PaymosPlugin::CRON_KEY,
+            'task_type' => 'plugin',
+            'dir' => 'paymos',
+            'name' => 'PaymosPlugin.cron.reconcile_name',
+            'description' => 'PaymosPlugin.cron.reconcile_desc',
+            'is_lang' => '0',
+            'type' => 'interval',
+        );
+        return $id;
+    }
+
+    public function edit($taskId, array $vars): void
+    {
+        $this->edits[] = array($taskId, $vars);
+        foreach ($vars as $k => $v) {
+            $this->tasks[$taskId]->{$k} = (string) $v;
+        }
+    }
+
+    /** @return object|false */
+    public function getByKey($key, $dir = null, $type = 'plugin')
+    {
+        foreach ($this->tasks as $task) {
+            if ($task->key === $key && $task->dir === $dir && $task->task_type === $type) {
+                return clone $task;
+            }
+        }
+        return false;
+    }
+
+    /** @return int */
+    public function addTaskRun($taskId, array $vars)
+    {
+        $this->runCalls[] = array($taskId, $vars);
+        $id = $this->nextRun++;
+        $this->runs[$id] = array('task_id' => $taskId) + $vars;
+        return $id;
+    }
+
+    /** @return object|false */
+    public function getTaskRunByKey($key, $dir = null, $system = false, $type = 'plugin')
+    {
+        $task = $this->getByKey($key, $dir, $type);
+        if ($task === false) {
+            return false;
+        }
+        foreach ($this->runs as $id => $run) {
+            if ($run['task_id'] === $task->id) {
+                return (object) array('task_run_id' => $id, 'task_id' => $task->id, 'key' => $key);
+            }
+        }
+        return false;
+    }
+
+    public function deleteTaskRun($taskRunId): void
+    {
+        $this->deletedRuns[] = $taskRunId;
+        unset($this->runs[$taskRunId]);
+    }
+
+    public function deleteTask($taskId, $taskType, $dir): void
+    {
+        $this->deletedTasks[] = array($taskId, $taskType, $dir);
+        unset($this->tasks[$taskId]);
+        foreach ($this->runs as $runId => $run) {
+            if ($run['task_id'] === $taskId) {
+                unset($this->runs[$runId]);
+            }
+        }
+    }
+
+    /** @return mixed */
+    public function errors()
+    {
+        return $this->errors;
+    }
+}
+
+/**
+ * Wraps the in-memory driver and makes the next webhook-dedup commit fail (a lost write).
+ */
+final class CommitFailingDb implements DbDriverInterface
+{
+    /** @var InMemoryDbDriver */
+    private $inner;
+    /** @var bool */
+    public $failNextEventCommit = false;
+
+    public function __construct(InMemoryDbDriver $inner)
+    {
+        $this->inner = $inner;
+    }
+
+    public function driverName(): string { return $this->inner->driverName(); }
+    public function inTransaction(): bool { return $this->inner->inTransaction(); }
+    public function tableExists(string $table): bool { return $this->inner->tableExists($table); }
+    public function execute(string $sql, array $params = array()): int { return $this->inner->execute($sql, $params); }
+    public function fetchOne(string $sql, array $params = array()): ?array { return $this->inner->fetchOne($sql, $params); }
+    public function fetchAll(string $sql, array $params = array()): array { return $this->inner->fetchAll($sql, $params); }
+    public function insertUnique(string $table, array $columns, ?string $conflictColumn = null): bool { return $this->inner->insertUnique($table, $columns, $conflictColumn); }
+    public function casUpdate(string $table, array $set, array $where, array $conditions = array()): int
+    {
+        if ($table === PdoEventStore::TABLE && $this->failNextEventCommit && ($set['state'] ?? '') === 'committed') {
+            $this->failNextEventCommit = false;
+            return 0;
+        }
+        return $this->inner->casUpdate($table, $set, $where, $conditions);
+    }
+    public function deleteExpired(string $table, string $column, int $now, int $limit = 100): int { return $this->inner->deleteExpired($table, $column, $now, $limit); }
+    public function beginTransaction(): void { $this->inner->beginTransaction(); }
+    public function commit(): bool { return $this->inner->commit(); }
+    public function rollBack(): void { $this->inner->rollBack(); }
+    public function acquireNamedLock(string $name, int $timeoutSeconds = 10): bool { return $this->inner->acquireNamedLock($name, $timeoutSeconds); }
+    public function isNamedLockOwned(string $name): bool { return $this->inner->isNamedLockOwned($name); }
+    public function releaseNamedLock(string $name): void { $this->inner->releaseNamedLock($name); }
+}
+
+/**
+ * @param array<string, mixed> $overrides
+ */
+function seedSnapshot(SnapshotStore $snapshots, array $overrides): void
+{
+    $snapshots->save(array_merge(array(
+        'external_order_id' => 'blesta_inv_0_r0',
+        'paymos_invoice_id' => 'inv_0',
+        'platform_ref' => 'inv_0',
+        'blesta_invoice_id' => null,
+        'client_id' => '9',
+        'amount' => '10',
+        'currency' => 'USD',
+        'environment' => 'sandbox',
+        'project_id' => 'prj_sandbox_blesta_001',
+        'payment_url' => 'https://checkout.paymos.io/inv/inv_0',
+        'status' => 'awaiting_payment',
+        'created_at' => 1764000000,
+    ), $overrides));
+}
+
+/**
+ * @param array<string, mixed> $invoice
+ */
+function invoiceWebhook(string $eventId, string $eventType, array $invoice, int $occurredAt): string
+{
+    return (string) json_encode(array(
+        'event_id' => $eventId,
+        'event_type' => $eventType,
+        'version' => 1,
+        'occurred_at' => $occurredAt,
+        'data' => $invoice,
+    ));
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function sandboxInvoice(string $invoiceId, string $externalId, string $status, string $amount, array $extra = array()): array
+{
+    return array_merge(array(
+        'invoice_id' => $invoiceId,
+        'project_id' => 'prj_sandbox_blesta_001',
+        'status' => $status,
+        'is_test' => true,
+        'order' => array('external_id' => $externalId, 'amount' => $amount, 'currency' => 'USD'),
+    ), $extra);
+}
+
+runTest('8.1 CMSP-05: cron task registered via CronTasks API (task_type/dir/is_lang), uninstall removes the company task run', function () {
+    $prev = Loader::$models;
+    $cron = new FakeCronTasks();
+    Loader::$models['CronTasks'] = $cron;
+    try {
+        $db = new InMemoryDbDriver();
+        $plugin = new PaymosPlugin();
+        $plugin->setDbDriver($db);
+        $plugin->install(7);
+
+        assertSame(1, count($cron->addCalls), 'CronTasks::add must be called once.');
+        $vars = $cron->addCalls[0];
+        assertSame(PaymosPlugin::CRON_KEY, $vars['key']);
+        assertSame('plugin', $vars['task_type'] ?? null, 'task_type must be plugin.');
+        assertSame('paymos', $vars['dir'] ?? null, 'dir must be the plugin directory.');
+        assertSame(1, $vars['is_lang'] ?? null, 'Name/description are language keys: is_lang must be 1.');
+        assertTrue(!array_key_exists('plugin_dir', $vars), 'Legacy plugin_dir must not be sent.');
+        assertSame(1, count($cron->runs), 'A 10-minute task run must be created for the company.');
+        $run = array_values($cron->runs)[0];
+        assertSame(10, $run['interval']);
+        assertSame(1, $run['enabled']);
+
+        $runId = (int) array_keys($cron->runs)[0];
+        $plugin->uninstall(7, false);
+        assertSame(array($runId), $cron->deletedRuns, 'Uninstall must delete this company task run.');
+        assertSame(array(), $cron->deletedTasks, 'A non-last instance keeps the global task definition.');
+
+        // Legacy install: raw-key task with is_lang=0 and no run -> upgrade repairs it once.
+        $legacy = new FakeCronTasks();
+        Loader::$models['CronTasks'] = $legacy;
+        $legacyId = $legacy->seedLegacyTask();
+        $plugin->upgrade('1.0.4', 7);
+        $plugin->upgrade('1.0.4', 7);
+        assertSame('1', $legacy->tasks[$legacyId]->is_lang, 'Upgrade must switch the task name to a language definition.');
+        assertSame(1, count($legacy->runs), 'Upgrade must ensure exactly one task run.');
+        $plugin->uninstall(7, true);
+        assertSame(array(array($legacyId, 'plugin', 'paymos')), $legacy->deletedTasks, 'Last instance must delete the task definition.');
+
+        // add() rejected and nothing to fall back to -> warning logged with Blesta errors.
+        $broken = new FakeCronTasks();
+        $broken->failAdd = true;
+        Loader::$models['CronTasks'] = $broken;
+        $plugin2 = new PaymosPlugin();
+        $plugin2->setDbDriver(new InMemoryDbDriver());
+        $plugin2->install(8);
+        $logged = array_filter($plugin2->getLogs(), static fn (array $l): bool => $l['event'] === 'plugin.cron_register_error');
+        assertSame(1, count($logged), 'A rejected CronTasks::add must be logged.');
+        assertSame(0, count($broken->runs));
+    } finally {
+        Loader::$models = $prev;
+    }
+});
+
+runTest('8.2 CMSP-06: Connect and Refunds are staff permissions; requireLogin() denies a group without them; upgrade keeps the upgrading admin', function () {
+    $plugin = new PaymosPlugin();
+    $groups = $plugin->getPermissionGroups();
+    assertSame(1, count($groups));
+    assertSame('staff', $groups[0]['level']);
+    $groupAlias = $groups[0]['alias'];
+    $aliases = array();
+    foreach ($plugin->getPermissions() as $permission) {
+        assertSame($groupAlias, $permission['group_alias']);
+        assertSame('*', $permission['action']);
+        assertTrue(trim((string) $permission['name']) !== '');
+        $aliases[] = $permission['alias'];
+    }
+    sort($aliases);
+    assertSame(array('paymos.admin_connect', 'paymos.admin_refunds'), $aliases);
+
+    // Fresh install: Blesta grants the installer's group, the plugin records that permissions are live.
+    $db = new InMemoryDbDriver();
+    $installer = new PaymosPlugin();
+    $installer->setDbDriver($db);
+    $installer->install(13);
+    assertSame(true, StaffPermissions::isGranted(new CredentialStore($db)), 'Install marks the staff permissions as granted.');
+
+    AppController::$deniedAcos = array('paymos.admin_connect', 'paymos.admin_refunds');
+    try {
+        foreach (array('admin_connect' => new AdminRefunds(), 'admin_refunds' => new AdminRefunds()) as $name => $ctrl) {
+            $ctrl->setDbDriver($db);
+            $ctrl->plugin = 'paymos';
+            $ctrl->controller = $name;
+            $ctrl->action = 'index';
+            assertThrows(\RuntimeException::class, static fn () => $ctrl->preAction(), 'blesta_acl_denied:paymos.' . $name);
+        }
+    } finally {
+        AppController::$deniedAcos = array();
+    }
+    $allowed = new AdminRefunds();
+    $allowed->setDbDriver($db);
+    $allowed->plugin = 'paymos';
+    $allowed->controller = 'admin_refunds';
+    $allowed->action = 'index';
+    $allowed->preAction();
+    assertSame(1, $allowed->requireLoginCalls, 'preAction must call requireLogin() exactly once.');
+});
+
+runTest('8.3 CMSP-07: partial and "Other Payment Amount" payments are recorded with Blesta per-invoice amounts', function () {
+    $db = new InMemoryDbDriver();
+    $now = 1764100000;
+    $clock = static fn (): int => $now;
+    (new CredentialStore($db, null, $clock))->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    $prev = Loader::$models;
+    $due = '100.00';
+    Loader::$models['Invoices'] = new class($due) {
+        public $due;
+        public function __construct(&$due) { $this->due = &$due; }
+        public function get(int $id) {
+            return (object) array('id' => $id, 'client_id' => 9, 'status' => 'active', 'date_closed' => null, 'total' => $this->due, 'due' => $this->due, 'currency' => 'USD');
+        }
+    };
+    $created = array();
+    $transport = new SpyTransport(function (array $req) use (&$created): HttpResponse {
+        $path = (string) parse_url($req['url'], PHP_URL_PATH);
+        if ($req['method'] === 'POST' && $path === '/v1/invoices') {
+            $body = json_decode((string) $req['body'], true);
+            $id = 'inv_part_' . (count($created) + 1);
+            $created[$id] = $body;
+            return jsonResponse(201, array('invoice_id' => $id, 'payment_url' => 'https://checkout.paymos.io/inv/' . $id, 'status' => 'awaiting_client'));
+        }
+        if ($req['method'] === 'GET' && strncmp($path, '/v1/invoices/', 13) === 0) {
+            $id = substr($path, 13);
+            $body = $created[$id];
+            return jsonResponse(200, sandboxInvoice($id, $body['external_order_id'], 'paid', $body['amount'], array('payment' => array('tx_hash' => '0x' . $id))));
+        }
+        throw new \RuntimeException('Unexpected request: ' . $req['method'] . ' ' . $path);
+    });
+
+    try {
+        $cases = array(
+            array('801', '40.00', array(array('id' => 801, 'amount' => '40.00')), '40', array(array('id' => 801, 'amount' => '40'))),
+            array('802', '120.00', array(array('id' => 802, 'amount' => '100.00')), '120', array(array('id' => 802, 'amount' => '100'))),
+        );
+        foreach ($cases as $i => $case) {
+            list($label, $total, $invoiceAmounts, $expectedAmount, $expectedInvoices) = $case;
+            $gw = makeGateway($db, $transport, $clock);
+            $html = $gw->buildProcess(array('client_id' => '9'), $total, $invoiceAmounts);
+            assertTrue($html !== '', 'Checkout must render for invoice ' . $label);
+            $paymosId = 'inv_part_' . ($i + 1);
+            $snapshot = $snapshots->findByInvoiceId($paymosId);
+            $body = invoiceWebhook('evt_part_' . $label, 'invoice.paid', sandboxInvoice($paymosId, $snapshot['external_order_id'], 'paid', $expectedAmount), $now);
+            $sig = signWebhook($body, 'whsec_sandbox_blesta_secret_001', $now);
+            $gw->setWebhookInputProvider(static fn (): string => $body, static fn (): array => array('X-Webhook-Signature' => $sig));
+            $tx = $gw->validate(array(), array());
+            assertSame(200, $gw->getLastHttpStatus(), 'Invoice ' . $label . ' payment must be accepted: ' . json_encode($gw->getLastWebhookResult()));
+            assertSame($expectedAmount, $tx['amount']);
+            assertSame($expectedInvoices, $tx['invoices'], 'Blesta must apply the amounts the client chose; the rest stays as credit.');
+        }
+
+        // The Blesta invoice changed after checkout -> still held for review (unchanged rule).
+        $gw = makeGateway($db, $transport, $clock);
+        assertTrue($gw->buildProcess(array('client_id' => '9'), '40.00', array(array('id' => 803, 'amount' => '40.00'))) !== '');
+        $due = '150.00';
+        $snapshot = $snapshots->findByInvoiceId('inv_part_3');
+        $body = invoiceWebhook('evt_part_changed', 'invoice.paid', sandboxInvoice('inv_part_3', $snapshot['external_order_id'], 'paid', '40'), $now);
+        $sig = signWebhook($body, 'whsec_sandbox_blesta_secret_001', $now);
+        $gw->setWebhookInputProvider(static fn (): string => $body, static fn (): array => array('X-Webhook-Signature' => $sig));
+        assertSame(null, $gw->validate(array(), array()));
+        assertSame(400, $gw->getLastHttpStatus(), 'A Blesta invoice edited after checkout must stay in manual review.');
+    } finally {
+        Loader::$models = $prev;
+    }
+});
+
+runTest('8.4 CMSP-08: a paid Paymos invoice is never reused; the next top-up or payment of a reopened invoice gets a new attempt', function () {
+    $db = new InMemoryDbDriver();
+    $store = new CredentialStore($db);
+    $store->saveCredentials(sampleCredentials());
+    $config = Config::fromStore(array('mode' => 'sandbox'), $store);
+    $snapshots = new SnapshotStore($db);
+    $posts = array();
+    $transport = new SpyTransport(function (array $req) use (&$posts): HttpResponse {
+        if ($req['method'] !== 'POST') {
+            throw new \RuntimeException('Only create is expected, got ' . $req['method'] . ' ' . $req['url']);
+        }
+        $posts[] = json_decode((string) $req['body'], true);
+        $id = 'inv_top_' . count($posts);
+        return jsonResponse(201, array('invoice_id' => $id, 'payment_url' => 'https://checkout.paymos.io/inv/' . $id, 'status' => 'awaiting_client'));
+    });
+    $checkout = new CheckoutService($config, $snapshots, static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport));
+
+    $first = $checkout->createCheckout('9', '50.00', 'USD', array());
+    $snapshots->updateStatus($first['paymos_invoice_id'], 'paid', '0xtop1');
+    $second = $checkout->createCheckout('9', '50.00', 'USD', array());
+    assertSame(false, $second['reused'], 'A second top-up must not reuse the paid checkout.');
+    assertSame('inv_top_2', $second['paymos_invoice_id']);
+    assertTrue($second['external_order_id'] !== $first['external_order_id'], 'A new external_order_id is required.');
+    assertSame(2, count($posts));
+
+    $paidInvoice = $checkout->createCheckout('9', '40.00', 'USD', array(array('id' => 805, 'amount' => '40.00')));
+    $snapshots->updateStatus($paidInvoice['paymos_invoice_id'], 'paid', '0xpart805');
+    $rest = $checkout->createCheckout('9', '60.00', 'USD', array(array('id' => 805, 'amount' => '60.00')));
+    assertSame('blesta_inv_805_r1', $rest['external_order_id'], 'The rest of a partly paid invoice must be payable.');
+    assertSame(4, count($posts), 'No cancel/GET of the paid invoice is needed.');
+});
+
+runTest('8.5 CMSP-09: a final 4xx closes the creating intent; the next attempt sends the current amount with a new key', function () {
+    $db = new InMemoryDbDriver();
+    $store = new CredentialStore($db);
+    $store->saveCredentials(sampleCredentials());
+    $config = Config::fromStore(array('mode' => 'sandbox'), $store);
+    $snapshots = new SnapshotStore($db);
+    $posts = array();
+    $plan = array('reject', 'ok');
+    $transport = new SpyTransport(function (array $req) use (&$posts, &$plan): HttpResponse {
+        $posts[] = json_decode((string) $req['body'], true);
+        $step = array_shift($plan);
+        if ($step === 'reject') {
+            return new HttpResponse(400, (string) json_encode(array('type' => 'about:blank', 'title' => 'Bad Request', 'status' => 400, 'detail' => 'Invoice amount is below the minimum.', 'code' => 'invoice_amount_below_minimum', 'field' => 'amount')), array('Content-Type' => 'application/problem+json'));
+        }
+        if ($step === 'crash') {
+            throw new \RuntimeException('Paymos HTTP error: connection reset');
+        }
+        $id = 'inv_4xx_' . count($posts);
+        return jsonResponse(201, array('invoice_id' => $id, 'payment_url' => 'https://checkout.paymos.io/inv/' . $id, 'status' => 'awaiting_client'));
+    });
+    $checkout = new CheckoutService($config, $snapshots, static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport));
+
+    assertThrows(\Paymos\Exception\ApiException::class, static fn () => $checkout->createCheckout('9', '0.50', 'USD', array(array('id' => 810, 'amount' => '0.50'))));
+    $failed = $snapshots->findByExternalOrderId('blesta_inv_810_r0');
+    assertSame(CheckoutService::STATUS_CREATE_FAILED, $failed['status'], 'A definitive 4xx must end the creating intent.');
+
+    $retry = $checkout->createCheckout('9', '15.00', 'USD', array(array('id' => 810, 'amount' => '15.00')));
+    assertSame('blesta_inv_810_r1', $retry['external_order_id']);
+    assertSame('15', $posts[1]['amount'], 'The next attempt must send the current amount.');
+    assertSame(2, count($posts));
+
+    // Lost response, then the replay is refused for good -> closed and a new key is cut in the same call.
+    $plan = array('crash', 'reject', 'ok');
+    $posts = array();
+    assertThrows(\RuntimeException::class, static fn () => $checkout->createCheckout('9', '30.00', 'USD', array(array('id' => 811, 'amount' => '30.00'))));
+    assertSame(CheckoutService::STATUS_CREATING, $snapshots->findByExternalOrderId('blesta_inv_811_r0')['status']);
+    $next = $checkout->createCheckout('9', '35.00', 'USD', array(array('id' => 811, 'amount' => '35.00')));
+    assertSame('blesta_inv_811_r1', $next['external_order_id']);
+    assertSame(array('30', '30', '35'), array_column($posts, 'amount'));
+    assertSame(CheckoutService::STATUS_CREATE_FAILED, $snapshots->findByExternalOrderId('blesta_inv_811_r0')['status']);
+    foreach ($snapshots->findUnpaidRecent(50, 0) as $row) {
+        assertTrue($row['status'] !== CheckoutService::STATUS_CREATE_FAILED, 'The reconciler never picks create_failed rows.');
+    }
+});
+
+runTest('8.6 CMSP-10: a passed local expires_at is re-read from the server before refusing the buyer', function () {
+    $db = new InMemoryDbDriver();
+    $now = 1764110000;
+    $clock = static fn (): int => $now;
+    $store = new CredentialStore($db, null, $clock);
+    $store->saveCredentials(sampleCredentials());
+    $config = Config::fromStore(array('mode' => 'sandbox'), $store);
+    $snapshots = new SnapshotStore($db, $clock);
+    seedSnapshot($snapshots, array(
+        'external_order_id' => 'blesta_inv_815_r0',
+        'paymos_invoice_id' => 'inv_ttl_815',
+        'platform_ref' => 'inv_815',
+        'blesta_invoice_id' => 815,
+        'amount' => '20',
+        'payment_url' => 'https://checkout.paymos.io/inv/inv_ttl_815',
+        'status' => 'awaiting_client',
+        'expires_at' => $now - 600,
+    ));
+    $transport = new SpyTransport(function (array $req) use ($now): HttpResponse {
+        $path = (string) parse_url($req['url'], PHP_URL_PATH);
+        if ($req['method'] === 'GET' && $path === '/v1/invoices/inv_ttl_815') {
+            return jsonResponse(200, sandboxInvoice('inv_ttl_815', 'blesta_inv_815_r0', 'awaiting_payment', '20', array('expires_at' => $now + 1200)));
+        }
+        if ($req['method'] === 'POST' && $path === '/v1/invoices/inv_ttl_815/cancel') {
+            return jsonResponse(409, array('type' => 'about:blank', 'title' => 'Conflict', 'status' => 409, 'detail' => 'Cannot cancel.', 'code' => 'invoice_cannot_be_cancelled'));
+        }
+        throw new \RuntimeException('Unexpected request: ' . $req['method'] . ' ' . $path);
+    });
+    $checkout = new CheckoutService($config, $snapshots, static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport), null, $clock);
+    $res = $checkout->createCheckout('9', '20.00', 'USD', array(array('id' => 815, 'amount' => '20.00')));
+    assertSame(true, $res['reused'], 'The invoice the server still accepts payment for must be reused.');
+    assertSame('https://checkout.paymos.io/inv/inv_ttl_815', $res['payment_url']);
+    assertSame(array('GET'), array_column($transport->requests, 'method'), 'Only a read is needed; no cancel.');
+});
+
+runTest('8.7 CMSP-11: the "already paid in Blesta" guard keeps the recorded status; a real Paymos payment after it is flagged for review', function () {
+    $db = new InMemoryDbDriver();
+    $now = 1764120000;
+    $clock = static fn (): int => $now;
+    $credStore = new CredentialStore($db, null, $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $config = Config::fromStore(array('mode' => 'sandbox'), $credStore);
+    $snapshots = new SnapshotStore($db, $clock);
+    $eventStore = new PdoEventStore($db, $clock);
+    seedSnapshot($snapshots, array(
+        'external_order_id' => 'blesta_inv_820_r0',
+        'paymos_invoice_id' => 'inv_card_820',
+        'platform_ref' => 'inv_820',
+        'blesta_invoice_id' => 820,
+        'amount' => '30',
+        'status' => 'awaiting_payment',
+    ));
+    $notes = array();
+    $apiStatus = 'confirming';
+    $transport = new SpyTransport(function (array $req) use (&$apiStatus): HttpResponse {
+        return jsonResponse(200, sandboxInvoice('inv_card_820', 'blesta_inv_820_r0', $apiStatus, '30', array('payment' => array('tx_hash' => '0xcrypto820'))));
+    });
+    $processor = new CallbackProcessor(
+        $config,
+        $snapshots,
+        $eventStore,
+        static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport),
+        static fn (): array => array('paid' => true, 'amount' => '0', 'currency' => 'USD'),
+        null,
+        null,
+        $clock,
+        null,
+        function (array $snapshot, string $title, string $body) use (&$notes): void {
+            $notes[] = array('client_id' => $snapshot['client_id'], 'title' => $title, 'body' => $body);
+        }
+    );
+
+    $confirming = invoiceWebhook('evt_card_confirming', 'invoice.confirming', sandboxInvoice('inv_card_820', 'blesta_inv_820_r0', 'confirming', '30'), $now);
+    $res1 = $processor->handle($confirming, signWebhook($confirming, 'whsec_sandbox_blesta_secret_001', $now));
+    assertSame(200, $res1['http_status']);
+    assertSame('ignored_already_paid', $res1['status']);
+    assertTrue($snapshots->findByInvoiceId('inv_card_820')['status'] !== 'paid', 'A non-payment event must not write paid.');
+    assertSame(null, $snapshots->findPaidByBlestaInvoiceId(820), 'No Paymos payment exists yet.');
+
+    $apiStatus = 'paid';
+    $paid = invoiceWebhook('evt_card_paid', 'invoice.paid', sandboxInvoice('inv_card_820', 'blesta_inv_820_r0', 'paid', '30'), $now);
+    $res2 = $processor->handle($paid, signWebhook($paid, 'whsec_sandbox_blesta_secret_001', $now));
+    assertSame(200, $res2['http_status']);
+    assertSame(null, $res2['transaction'], 'Blesta invoice is closed: nothing is recorded automatically.');
+    $meta = SnapshotStore::decodeMeta($snapshots->findByInvoiceId('inv_card_820')['payload_meta']);
+    assertSame(true, $meta['manual_review'] ?? null, 'The Paymos payment must be flagged for review.');
+    assertSame('blesta_invoice_already_paid', $meta['manual_review_reason'] ?? null);
+    assertSame(1, count($notes), 'Admin must see a native note.');
+    assertSame('9', $notes[0]['client_id']);
+});
+
+runTest('8.8 CMSP-12: paid_late and manual review leave one native Blesta client note', function () {
+    $db = new InMemoryDbDriver();
+    $now = 1764130000;
+    $clock = static fn (): int => $now;
+    (new CredentialStore($db, null, $clock))->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    seedSnapshot($snapshots, array(
+        'external_order_id' => 'blesta_inv_825_r0',
+        'paymos_invoice_id' => 'inv_late_825',
+        'platform_ref' => 'inv_825',
+        'blesta_invoice_id' => 825,
+        'client_id' => '31',
+        'amount' => '45',
+        'status' => 'expired',
+        'final_status' => 'expired',
+    ));
+    $prev = Loader::$models;
+    $added = array();
+    Loader::$models['Clients'] = new class($added) {
+        public $added;
+        public function __construct(&$added) { $this->added = &$added; }
+        public function addNote($clientId, $staffId, array $vars) { $this->added[] = array('client_id' => $clientId, 'staff_id' => $staffId, 'vars' => $vars); return count($this->added); }
+        public function errors() { return false; }
+    };
+    $late = sandboxInvoice('inv_late_825', 'blesta_inv_825_r0', 'expired', '45', array('paid_late_at' => $now - 30));
+    $transport = new SpyTransport(static fn (): HttpResponse => jsonResponse(200, $late));
+    try {
+        foreach (array('evt_late_825_a', 'evt_late_825_b') as $eventId) {
+            $body = invoiceWebhook($eventId, 'invoice.paid_late', $late, $now);
+            $sig = signWebhook($body, 'whsec_sandbox_blesta_secret_001', $now);
+            $gw = makeGateway($db, $transport, $clock);
+            $gw->setWebhookInputProvider(static fn (): string => $body, static fn (): array => array('X-Webhook-Signature' => $sig));
+            $gw->validate(array(), array());
+            assertSame(200, $gw->getLastHttpStatus());
+        }
+        assertSame(1, count($added), 'paid_late must add exactly one client note.');
+        assertSame(31, $added[0]['client_id']);
+        assertSame(null, $added[0]['staff_id']);
+        assertSame(1, $added[0]['vars']['stickied']);
+        assertTrue(strpos($added[0]['vars']['description'], 'inv_late_825') !== false, 'The note names the Paymos invoice.');
+
+        // Amount mismatch: retried delivery keeps one note.
+        seedSnapshot($snapshots, array(
+            'external_order_id' => 'blesta_inv_826_r0',
+            'paymos_invoice_id' => 'inv_mm_826',
+            'platform_ref' => 'inv_826',
+            'blesta_invoice_id' => 826,
+            'client_id' => '32',
+            'amount' => '45',
+            'status' => 'awaiting_payment',
+        ));
+        $paid = sandboxInvoice('inv_mm_826', 'blesta_inv_826_r0', 'paid', '45');
+        $mmTransport = new SpyTransport(static fn (): HttpResponse => jsonResponse(200, $paid));
+        $body = invoiceWebhook('evt_mm_826', 'invoice.paid', $paid, $now);
+        $sig = signWebhook($body, 'whsec_sandbox_blesta_secret_001', $now);
+        for ($i = 0; $i < 2; $i++) {
+            $gw = makeGateway($db, $mmTransport, $clock);
+            $gw->setBillingStateResolver(static fn (): array => array('paid' => false, 'amount' => '60', 'currency' => 'USD'));
+            $gw->setWebhookInputProvider(static fn (): string => $body, static fn (): array => array('X-Webhook-Signature' => $sig));
+            $gw->validate(array(), array());
+            assertSame(400, $gw->getLastHttpStatus());
+        }
+        assertSame(2, count($added), 'Manual review must add exactly one more note across retries.');
+        assertSame(32, $added[1]['client_id']);
+    } finally {
+        Loader::$models = $prev;
+    }
+});
+
+runTest('8.9 CMSP-13: a fresh create never binds a final invoice the server returned for a reused key', function () {
+    $db = new InMemoryDbDriver();
+    $store = new CredentialStore($db);
+    $store->saveCredentials(sampleCredentials());
+    $config = Config::fromStore(array('mode' => 'sandbox'), $store);
+    $snapshots = new SnapshotStore($db);
+    $posts = array();
+    $transport = new SpyTransport(function (array $req) use (&$posts): HttpResponse {
+        $body = json_decode((string) $req['body'], true);
+        $posts[] = $body;
+        if ($body['external_order_id'] === 'blesta_inv_830_r0') {
+            return jsonResponse(200, array('invoice_id' => 'inv_foreign_old', 'payment_url' => 'https://checkout.paymos.io/inv/inv_foreign_old', 'status' => 'paid'));
+        }
+        return jsonResponse(201, array('invoice_id' => 'inv_new_830', 'payment_url' => 'https://checkout.paymos.io/inv/inv_new_830', 'status' => 'awaiting_client'));
+    });
+    $checkout = new CheckoutService($config, $snapshots, static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport));
+    $res = $checkout->createCheckout('9', '100.00', 'USD', array(array('id' => 830, 'amount' => '100.00')));
+    assertSame('inv_new_830', $res['paymos_invoice_id'], 'A paid invoice of another installation must not be bound.');
+    assertSame('blesta_inv_830_r1', $res['external_order_id']);
+    assertSame(null, $snapshots->findByInvoiceId('inv_foreign_old'), 'The foreign invoice is never stored.');
+    assertSame(CheckoutService::STATUS_CREATE_FAILED, $snapshots->findByExternalOrderId('blesta_inv_830_r0')['status']);
+    assertSame(2, count($posts));
+});
+
+runTest('8.10 CMSP-14: after a failed dedup commit the retried webhook still hands Blesta the payment', function () {
+    $inner = new InMemoryDbDriver();
+    $db = new CommitFailingDb($inner);
+    $now = 1764140000;
+    $clock = static function () use (&$now): int {
+        return $now;
+    };
+    $credStore = new CredentialStore($inner, null, $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $config = Config::fromStore(array('mode' => 'sandbox'), $credStore);
+    $snapshots = new SnapshotStore($inner, $clock);
+    seedSnapshot($snapshots, array(
+        'external_order_id' => 'blesta_inv_835_r0',
+        'paymos_invoice_id' => 'inv_crash_835',
+        'platform_ref' => 'inv_835',
+        'blesta_invoice_id' => 835,
+        'payload_meta' => json_encode(array('invoices' => array(array('id' => 835, 'amount' => '25')))),
+        'amount' => '25',
+        'status' => 'awaiting_payment',
+    ));
+    $paid = sandboxInvoice('inv_crash_835', 'blesta_inv_835_r0', 'paid', '25', array('payment' => array('tx_hash' => '0xcrash835')));
+    $transport = new SpyTransport(static fn (): HttpResponse => jsonResponse(200, $paid));
+    $processor = new CallbackProcessor(
+        $config,
+        $snapshots,
+        new PdoEventStore($db, $clock),
+        static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport),
+        static fn (): array => array('paid' => false, 'amount' => '25', 'currency' => 'USD'),
+        null,
+        null,
+        $clock,
+        null,
+        null,
+        static fn (string $txId): ?bool => false
+    );
+    $body = invoiceWebhook('evt_crash_835', 'invoice.paid', $paid, $now);
+    $db->failNextEventCommit = true;
+    $first = $processor->handle($body, signWebhook($body, 'whsec_sandbox_blesta_secret_001', $now));
+    assertTrue($first['http_status'] >= 400, 'A failed commit must not acknowledge the delivery.');
+    assertSame(null, $first['transaction'], 'Blesta records nothing on a failed delivery.');
+
+    $now += PdoEventStore::RESERVATION_SECONDS + 1;
+    $retry = $processor->handle($body, signWebhook($body, 'whsec_sandbox_blesta_secret_001', $now));
+    assertSame(200, $retry['http_status']);
+    assertTrue(is_array($retry['transaction']), 'The retry must hand Blesta the payment again (Blesta upserts by transaction_id).');
+    assertSame('0xcrash835', $retry['transaction']['transaction_id']);
+    assertSame('25', $retry['transaction']['amount']);
+    assertSame(array(array('id' => 835, 'amount' => '25')), $retry['transaction']['invoices']);
+});
+
+runTest('8.11 CMSP-15: cron records a payment once: rejected Transactions::add stays retryable, a stale row after the webhook adds nothing', function () {
+    $db = new InMemoryDbDriver();
+    $now = 1764150000;
+    $clock = static function () use (&$now): int {
+        return $now;
+    };
+    $credStore = new CredentialStore($db, null, $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    seedSnapshot($snapshots, array(
+        'external_order_id' => 'blesta_inv_840_r0',
+        'paymos_invoice_id' => 'inv_cron_840',
+        'platform_ref' => 'inv_840',
+        'blesta_invoice_id' => 840,
+        'payload_meta' => json_encode(array('invoices' => array(array('id' => 840, 'amount' => '15')))),
+        'amount' => '15',
+        'status' => 'awaiting_payment',
+        'created_at' => $now - 300,
+    ));
+    $prev = Loader::$models;
+    $added = array();
+    $addResult = null;
+    $existing = null;
+    Loader::$models['Invoices'] = new class {
+        public function get(int $id) { return (object) array('id' => $id, 'client_id' => 9, 'status' => 'active', 'date_closed' => null, 'total' => '15', 'due' => '15', 'currency' => 'USD'); }
+    };
+    Loader::$models['GatewayManager'] = new class {
+        public function getByClass(string $class, int $companyId) { return array((object) array('id' => 42)); }
+    };
+    Loader::$models['Transactions'] = new class($added, $addResult, $existing) {
+        public $added; public $addResult; public $existing;
+        public function __construct(&$added, &$addResult, &$existing) { $this->added = &$added; $this->addResult = &$addResult; $this->existing = &$existing; }
+        public function getByTransactionId($txId, $clientId = null, $gatewayId = null) { return $this->existing; }
+        public function add(array $vars) { $this->added[] = $vars; return $this->addResult; }
+        public function apply($txId, array $vars): void {}
+        public function errors() { return $this->addResult ? false : array('amount' => array('format' => 'Amount is invalid.')); }
+    };
+    $transport = new SpyTransport(static function (array $req): HttpResponse {
+        $path = (string) parse_url($req['url'], PHP_URL_PATH);
+        if ($path === '/v1/invoices/inv_cron_840') {
+            return jsonResponse(200, sandboxInvoice('inv_cron_840', 'blesta_inv_840_r0', 'paid', '15', array('payment' => array('tx_hash' => '0xcron840'))));
+        }
+        return jsonResponse(200, array('items' => array(), 'next_cursor' => null));
+    });
+    try {
+        $plugin = new PaymosPlugin();
+        $plugin->setDbDriver($db);
+        $plugin->setClock($clock);
+        $plugin->setMeta(array('mode' => 'sandbox'));
+        $plugin->setClientFactory(static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport));
+        $res = $plugin->cron(PaymosPlugin::CRON_KEY);
+        assertSame(1, count($added), 'Transactions::add was attempted.');
+        assertSame(1, $res['reconcile']['errors'], 'A rejected Transactions::add must be an error.');
+        assertSame('awaiting_payment', $snapshots->findByInvoiceId('inv_cron_840')['status'], 'The snapshot must stay retryable.');
+
+        // Blesta already has the transaction (recorded by the webhook) -> no second add.
+        $existing = (object) array('id' => 9840, 'transaction_id' => '0xcron840');
+        $now += Reconciler::THROTTLE_SECONDS + 1;
+        $plugin->cron(PaymosPlugin::CRON_KEY);
+        assertSame(1, count($added), 'An existing Blesta transaction must not be added again.');
+        assertSame('paid', $snapshots->findByInvoiceId('inv_cron_840')['status']);
+
+        // A late webhook for a payment the cron confirmed in Blesta is not handed over again
+        // (that would only re-send Blesta's payment email).
+        $lateHook = new CallbackProcessor(
+            Config::fromStore(array('mode' => 'sandbox'), $credStore),
+            $snapshots,
+            new PdoEventStore($db, $clock),
+            static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport),
+            static fn (): array => array('paid' => true, 'amount' => '0', 'currency' => 'USD'),
+            null,
+            null,
+            $clock
+        );
+        $lateBody = invoiceWebhook('evt_cron_840_late', 'invoice.paid', sandboxInvoice('inv_cron_840', 'blesta_inv_840_r0', 'paid', '15'), $now);
+        $late = $lateHook->handle($lateBody, signWebhook($lateBody, 'whsec_sandbox_blesta_secret_001', $now));
+        assertSame(200, $late['http_status']);
+        assertSame(null, $late['transaction'], 'Blesta already holds the cron-recorded transaction.');
+    } finally {
+        Loader::$models = $prev;
+    }
+
+    // Stale row read before the webhook marked it paid must not apply a second time.
+    seedSnapshot($snapshots, array(
+        'external_order_id' => 'blesta_inv_841_r0',
+        'paymos_invoice_id' => 'inv_race_841',
+        'platform_ref' => 'inv_841',
+        'blesta_invoice_id' => 841,
+        'amount' => '15',
+        'status' => 'awaiting_payment',
+    ));
+    $staleRow = $snapshots->findByExternalOrderId('blesta_inv_841_r0');
+    $paid = sandboxInvoice('inv_race_841', 'blesta_inv_841_r0', 'paid', '15', array('payment' => array('tx_hash' => '0xrace841')));
+    $raceTransport = new SpyTransport(static fn (): HttpResponse => jsonResponse(200, $paid));
+    $applied = 0;
+    $processor = new CallbackProcessor(
+        Config::fromStore(array('mode' => 'sandbox'), $credStore),
+        $snapshots,
+        new PdoEventStore($db, $clock),
+        static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $raceTransport),
+        static fn (): array => array('paid' => false, 'amount' => '15', 'currency' => 'USD'),
+        null,
+        function () use (&$applied): void {
+            $applied++;
+        },
+        $clock
+    );
+    $body = invoiceWebhook('evt_race_841', 'invoice.paid', $paid, $now);
+    $hook = $processor->handle($body, signWebhook($body, 'whsec_sandbox_blesta_secret_001', $now));
+    assertTrue(is_array($hook['transaction']), 'The webhook hands the payment to Blesta.');
+    assertSame(false, $processor->applyTrustedInvoice($paid, $staleRow, $now), 'The cron must re-read the row and skip it.');
+    assertSame(0, $applied, 'The cron applier must not record the payment a second time.');
+});
+
+runTest('8.12 CMSP-17: cron resolves the Blesta state like the webhook (due across every invoice of the payment)', function () {
+    $db = new InMemoryDbDriver();
+    $now = 1764160000;
+    $clock = static fn (): int => $now;
+    (new CredentialStore($db, null, $clock))->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    seedSnapshot($snapshots, array(
+        'external_order_id' => 'blesta_inv_845_846_r0',
+        'paymos_invoice_id' => 'inv_multi_845',
+        'platform_ref' => 'inv_845_846',
+        'blesta_invoice_id' => null,
+        'payload_meta' => json_encode(array('invoices' => array(array('id' => 845, 'amount' => '25'), array('id' => 846, 'amount' => '25')), 'invoice_total' => '50')),
+        'amount' => '50',
+        'status' => 'awaiting_payment',
+        'created_at' => $now - 300,
+    ));
+    $prev = Loader::$models;
+    $added = array();
+    $applied = array();
+    Loader::$models['Invoices'] = new class {
+        public function get(int $id) { return (object) array('id' => $id, 'client_id' => 9, 'status' => 'active', 'date_closed' => null, 'total' => '40.00', 'due' => '25.00', 'currency' => 'USD'); }
+    };
+    Loader::$models['GatewayManager'] = new class {
+        public function getByClass(string $class, int $companyId) { return array((object) array('id' => 42)); }
+    };
+    Loader::$models['Transactions'] = new class($added, $applied) {
+        public $added; public $applied;
+        public function __construct(&$added, &$applied) { $this->added = &$added; $this->applied = &$applied; }
+        public function add(array $vars) { $this->added[] = $vars; return 9845; }
+        public function apply($txId, array $vars): void { $this->applied[] = $vars; }
+        public function errors() { return false; }
+    };
+    $transport = new SpyTransport(static function (array $req): HttpResponse {
+        $path = (string) parse_url($req['url'], PHP_URL_PATH);
+        if ($path === '/v1/invoices/inv_multi_845') {
+            return jsonResponse(200, sandboxInvoice('inv_multi_845', 'blesta_inv_845_846_r0', 'paid', '50', array('payment' => array('tx_hash' => '0xmulti845'))));
+        }
+        return jsonResponse(200, array('items' => array(), 'next_cursor' => null));
+    });
+    try {
+        $plugin = new PaymosPlugin();
+        $plugin->setDbDriver($db);
+        $plugin->setClock($clock);
+        $plugin->setMeta(array('mode' => 'sandbox'));
+        $plugin->setClientFactory(static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport));
+        $res = $plugin->cron(PaymosPlugin::CRON_KEY);
+        assertSame(1, $res['reconcile']['applied'], 'A two-invoice payment must be applied by the cron: ' . json_encode($plugin->getLogs()));
+        assertSame('50', $added[0]['amount']);
+        assertSame(array(array('invoice_id' => 845, 'amount' => '25'), array('invoice_id' => 846, 'amount' => '25')), $applied[0]['amounts']);
+    } finally {
+        Loader::$models = $prev;
+    }
+});
+
+runTest('8.13 CMSP-33: a non-final status never overwrites a recorded final status', function () {
+    $db = new InMemoryDbDriver();
+    $snapshots = new SnapshotStore($db);
+    seedSnapshot($snapshots, array(
+        'external_order_id' => 'blesta_inv_850_r0',
+        'paymos_invoice_id' => 'inv_order_850',
+        'platform_ref' => 'inv_850',
+        'blesta_invoice_id' => 850,
+        'status' => 'awaiting_payment',
+    ));
+    $snapshots->updateStatus('inv_order_850', 'paid', '0xorder850');
+    $snapshots->updateStatus('inv_order_850', 'confirming');
+    $row = $snapshots->findByInvoiceId('inv_order_850');
+    assertSame('paid', $row['status']);
+    assertSame('paid', $row['final_status']);
+    assertTrue(is_array($snapshots->findPaidByBlestaInvoiceId(850)), 'The paid payment must stay findable for refunds.');
+});
+
+runTest('8.14 CMSP-37: a zero-price line item keeps products[] (only negative prices fall back to amount-only)', function () {
+    $db = new InMemoryDbDriver();
+    $store = new CredentialStore($db);
+    $store->saveCredentials(sampleCredentials());
+    $config = Config::fromStore(array('mode' => 'sandbox'), $store);
+    $sent = array();
+    $transport = new SpyTransport(function (array $req) use (&$sent): HttpResponse {
+        $sent[] = json_decode((string) $req['body'], true);
+        $id = 'inv_free_' . count($sent);
+        return jsonResponse(201, array('invoice_id' => $id, 'payment_url' => 'https://checkout.paymos.io/inv/' . $id, 'status' => 'awaiting_client'));
+    });
+    $checkout = new CheckoutService($config, new SnapshotStore($db), static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport));
+    $checkout->createCheckout('9', '12.00', 'USD', array(array('id' => 855, 'amount' => '12.00')), array('line_items' => array(
+        array('description' => 'example.com registration', 'qty' => 1, 'amount' => '12.00'),
+        array('description' => 'Setup fee', 'qty' => 1, 'amount' => '0.00'),
+    )));
+    assertSame(2, count($sent[0]['products'] ?? array()), 'A free line item must not drop the whole product list.');
+    assertSame('0', $sent[0]['products'][1]['unit_amount']);
+
+    $checkout->createCheckout('9', '10.00', 'USD', array(array('id' => 856, 'amount' => '10.00')), array('line_items' => array(
+        array('description' => 'Hosting', 'qty' => 1, 'amount' => '12.00'),
+        array('description' => 'Discount', 'qty' => 1, 'amount' => '-2.00'),
+    )));
+    assertTrue(!isset($sent[1]['products']), 'A negative line item still falls back to amount-only.');
+});
+
+runTest('8.15 CMSP-16: a payment of two invoices is refundable from either invoice; a credit-only payment is refused with a clear message', function () {
+    $db = new InMemoryDbDriver();
+    $now = 1764170000;
+    $clock = static fn (): int => $now;
+    $credStore = new CredentialStore($db, null, $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    seedSnapshot($snapshots, array(
+        'external_order_id' => 'blesta_inv_860_861_r0',
+        'paymos_invoice_id' => 'inv_rf_860',
+        'platform_ref' => 'inv_860_861',
+        'blesta_invoice_id' => null,
+        'client_id' => '90',
+        'payload_meta' => json_encode(array('invoices' => array(array('id' => 860, 'amount' => '25'), array('id' => 861, 'amount' => '25')))),
+        'amount' => '50',
+        'transaction_id' => '0xtx860',
+        'status' => 'paid',
+        'final_status' => 'paid',
+    ));
+    $edits = 0;
+    $tx = array('id' => '9860', 'client_id' => '90', 'transaction_id' => '0xtx860', 'reference_id' => 'inv_rf_860', 'amount' => '50', 'currency' => 'USD', 'status' => 'approved', 'notes' => '');
+    $native = function (string $cmd, array $input) use (&$tx, &$edits, $snapshots): array {
+        if ($cmd === 'snapshot') {
+            return array(
+                'invoice' => array('id' => (int) $input['invoice_id'], 'client_id' => '90', 'status' => 'active', 'total' => '25', 'currency' => 'USD'),
+                'transaction' => $tx,
+                'mapping' => $snapshots->findPaidByBlestaInvoiceId((int) $input['invoice_id']),
+            );
+        }
+        if ($cmd === 'marker') {
+            return ($tx['status'] === 'refunded' && strpos($tx['notes'], (string) $input['marker']) !== false) ? array($tx) : array();
+        }
+        if ($cmd === 'Transactions::edit') {
+            $edits++;
+            $tx['status'] = $input['vars']['status'];
+            $tx['notes'] = $input['vars']['notes'];
+            return array('result' => 'success');
+        }
+        return array();
+    };
+    $ext = '';
+    $transport = new SpyTransport(function (array $req) use (&$ext): HttpResponse {
+        $path = (string) parse_url($req['url'], PHP_URL_PATH);
+        if ($req['method'] === 'POST' && $path === '/v1/refunds') {
+            $ext = json_decode((string) $req['body'], true)['external_order_id'];
+            return jsonResponse(201, array('withdrawal_id' => 'wd_rf_860', 'status' => 'completed'));
+        }
+        if ($path === '/v1/refunds/wd_rf_860') {
+            return jsonResponse(200, array('withdrawal_id' => 'wd_rf_860', 'invoice_id' => 'inv_rf_860', 'project_id' => 'prj_sandbox_blesta_001', 'is_test' => true, 'mode' => 'full', 'external_order_id' => $ext, 'status' => 'completed', 'amount' => '50', 'currency' => 'USDT', 'network' => 'arbitrum', 'first_sender' => '0xsender860'));
+        }
+        if ($path === '/v1/invoices/inv_rf_860') {
+            return jsonResponse(200, sandboxInvoice('inv_rf_860', 'blesta_inv_860_861_r0', 'paid', '50', array('refund_summary' => array('can_refund_full' => true, 'can_refund_overpayment' => false, 'full_refund_amount' => '50', 'overpayment_refund_amount' => null))));
+        }
+        if ($path === '/v1/refunds') {
+            return jsonResponse(200, array('items' => array(), 'next_cursor' => null));
+        }
+        throw new \RuntimeException('Unexpected request: ' . $req['method'] . ' ' . $path);
+    });
+
+    $controller = new AdminRefunds();
+    $controller->setDbDriver($db);
+    $controller->setClock($clock);
+    $controller->setMeta(array('mode' => 'sandbox'));
+    $controller->setClientFactory(static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport));
+    $controller->setRefundNativeHandler($native);
+    $controller->setStaffAuthenticator(static fn (): bool => true);
+    $controller->setCsrfVerifier(static fn (string $t): bool => $t === 'csrf_ok');
+
+    $panel = $controller->handlePanelRequest(861, 'en_us');
+    assertSame(200, $panel['http_status']);
+    assertSame(true, $panel['body']['can_refund_full'] ?? null, 'Invoice #861 is covered by the two-invoice payment.');
+    $ok = $controller->handleSubmitRequest('POST', array(
+        '_csrf_token' => 'csrf_ok',
+        'invoice_id' => '861',
+        'mode' => 'full',
+        'request_token' => CredentialStore::uuidV4(),
+    ));
+    assertSame(200, $ok['http_status'], 'Refund submit failed: ' . json_encode($ok['body']));
+    assertSame(RefundStates::PROJECTION_APPLIED, $ok['body']['projection_state']);
+    assertSame(1, $edits, 'The one Blesta transaction behind both invoices is marked refunded once.');
+
+    // Credit-only (no invoice) payment: native refund explains why it is not available here.
+    seedSnapshot($snapshots, array(
+        'external_order_id' => 'blesta_amt_credit_r0',
+        'paymos_invoice_id' => 'inv_credit_862',
+        'platform_ref' => 'amt_0123456789abcdef01234567',
+        'blesta_invoice_id' => null,
+        'payload_meta' => json_encode(array('invoices' => array())),
+        'amount' => '20',
+        'transaction_id' => '0xcredit862',
+        'status' => 'paid',
+        'final_status' => 'paid',
+    ));
+    $adapter = new RefundAdapter(Config::fromStore(array('mode' => 'sandbox'), $credStore), $credStore, $snapshots, new RefundIntentStore($db, $credStore, $clock), static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport), $native, null, $clock);
+    assertSame(null, $adapter->nativeRefund(array('reference_id' => 'inv_credit_862', 'transaction_id' => '0xcredit862', 'amount' => '20', 'locale' => 'en_us')));
+    assertSame(Translation::text('Paymos.!error.refund.credit_unsupported', 'en_us'), $adapter->lastNativeMessage());
+});
+
+runTest('8.16 CMSP-18: admin URLs keep the Blesta web directory (subfolder, no mod_rewrite)', function () {
+    assertSame('/billing/admin/plugin/paymos/admin_connect/', Config::adminUri('plugin/paymos/admin_connect/', '/billing/'));
+    assertSame('/billing/index.php/admin/plugin/paymos/admin_connect/', Config::adminUri('plugin/paymos/admin_connect/', '/billing/index.php/'));
+    assertSame('/admin/plugin/paymos/admin_refunds/', Config::adminUri('plugin/paymos/admin_refunds/', null));
+    Configure::set('Route.admin', 'staff');
+    try {
+        assertSame('/billing/staff/plugin/paymos/admin_connect/', Config::adminUri('plugin/paymos/admin_connect/', '/billing/'));
+    } finally {
+        Configure::set('Route.admin', 'admin');
+    }
+
+    $db = new InMemoryDbDriver();
+    $controller = new AdminRefunds();
+    $controller->setDbDriver($db);
+    $controller->setStaffAuthenticator(static fn (): bool => true);
+    $controller->base_uri = '/billing/index.php/admin/';
+    $page = $controller->handleIndexPage(0, 'en_us');
+    assertTrue(strpos($page['html'], 'data-submit-url="/billing/index.php/admin/plugin/paymos/admin_refunds/submit/"') !== false, 'Submit URL must use the controller base URI.');
+    assertTrue(strpos($page['html'], 'action="/billing/index.php/admin/plugin/paymos/admin_refunds/"') !== false, 'Lookup form must use the controller base URI.');
+});
+
+runTest('8.17 CMSP-34: refunds page and admin errors are localized; companion plugin ships 6 locales', function () use ($companionRoot) {
+    $db = new InMemoryDbDriver();
+    $controller = new AdminRefunds();
+    $controller->setDbDriver($db);
+    $controller->setStaffAuthenticator(static fn (): bool => true);
+    $page = $controller->handleIndexPage(0, 'ru_ru');
+    foreach (array('Blesta Invoice ID', '>Load<', 'Refund failed', 'Network error', '"Refund "') as $hardcoded) {
+        assertTrue(strpos($page['html'], $hardcoded) === false, 'Hardcoded English text on the ru_ru page: ' . $hardcoded);
+    }
+    assertTrue(strpos($page['html'], htmlspecialchars(Translation::text('Paymos.refunds.lookup_label', 'ru_ru'), ENT_QUOTES, 'UTF-8')) !== false);
+
+    $controller->setStaffAuthenticator(static fn (): bool => false);
+    $denied = $controller->handleSubmitRequest('POST', array('_csrf_token' => 'x'));
+    assertSame(403, $denied['http_status']);
+    assertSame('paymos_admin_access_denied', $denied['body']['reason'] ?? null);
+    assertSame(Language::_('PaymosPlugin.error.access_denied', true), $denied['body']['error']);
+    $connect = new AdminConnect();
+    $connect->setDbDriver($db);
+    $connect->setStaffAuthenticator(static fn (): bool => true);
+    $connect->setCsrfVerifier(static fn (string $t): bool => false);
+    $badCsrf = $connect->handleRequest('POST', array('action' => 'start', '_csrf_token' => 'nope'));
+    assertSame(Language::_('PaymosPlugin.error.csrf_invalid', true), $badCsrf['body']['error']);
+    assertSame('paymos_csrf_invalid', $badCsrf['body']['reason'] ?? null);
+    $badMethod = $connect->handleRequest('GET', array());
+    assertSame(Language::_('PaymosPlugin.error.method_not_allowed', true), $badMethod['body']['error']);
+
+    $load = static function (string $locale) use ($companionRoot): array {
+        $path = $companionRoot . DIRECTORY_SEPARATOR . 'language' . DIRECTORY_SEPARATOR . $locale . DIRECTORY_SEPARATOR . 'paymos_plugin.php';
+        assertTrue(is_file($path), 'Missing companion locale ' . $locale);
+        $lang = array();
+        include $path;
+        return $lang;
+    };
+    $en = $load('en_us');
+    $enKeys = array_keys($en);
+    sort($enKeys);
+    foreach (array('PaymosPlugin.permission.admin_main', 'PaymosPlugin.permission.admin_connect', 'PaymosPlugin.permission.admin_refunds', 'PaymosPlugin.error.invalid_action') as $required) {
+        assertTrue(isset($en[$required]), 'en_us must define ' . $required);
+    }
+    foreach (array('ru_ru', 'de_de', 'es_es', 'tr_tr', 'zh_cn') as $locale) {
+        $cat = $load($locale);
+        $keys = array_keys($cat);
+        sort($keys);
+        assertSame($enKeys, $keys, 'Companion key mismatch in ' . $locale);
+        foreach ($cat as $key => $value) {
+            assertTrue(trim((string) $value) !== '', "Empty {$key} in {$locale}");
+            if ($key !== 'PaymosPlugin.permission.admin_main') {
+                assertTrue($value !== $en[$key], "Untranslated {$key} in {$locale}");
+            }
+        }
+    }
+});
+
+runTest('8.18 CMSP-35: the native refund button can retry after a failed refund', function () {
+    $db = new InMemoryDbDriver();
+    $now = 1764180000;
+    $clock = static fn (): int => $now;
+    $credStore = new CredentialStore($db, null, $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    seedSnapshot($snapshots, array(
+        'external_order_id' => 'blesta_inv_870_r0',
+        'paymos_invoice_id' => 'inv_rf_870',
+        'platform_ref' => 'inv_870',
+        'blesta_invoice_id' => 870,
+        'client_id' => '33',
+        'amount' => '49.90',
+        'transaction_id' => '0xtx870',
+        'status' => 'paid',
+        'final_status' => 'paid',
+    ));
+    $native = function (string $cmd, array $input) use ($snapshots): array {
+        if ($cmd === 'snapshot') {
+            return array(
+                'invoice' => array('id' => 870, 'client_id' => '33', 'status' => 'active', 'total' => '49.90', 'currency' => 'USD'),
+                'transaction' => array('id' => '9870', 'client_id' => '33', 'transaction_id' => '0xtx870', 'reference_id' => 'inv_rf_870', 'amount' => '49.90', 'currency' => 'USD', 'status' => 'approved', 'notes' => ''),
+                'mapping' => $snapshots->findPaidByBlestaInvoiceId(870),
+            );
+        }
+        return array();
+    };
+    $posts = 0;
+    $lastExt = '';
+    $transport = new SpyTransport(function (array $req) use (&$posts, &$lastExt): HttpResponse {
+        $path = (string) parse_url($req['url'], PHP_URL_PATH);
+        if ($req['method'] === 'POST' && $path === '/v1/refunds') {
+            $posts++;
+            if ($posts === 1) {
+                return new HttpResponse(409, (string) json_encode(array('type' => 'about:blank', 'title' => 'Conflict', 'status' => 409, 'detail' => 'Refund not allowed now.', 'code' => 'refund_not_allowed')), array('Content-Type' => 'application/problem+json'));
+            }
+            $lastExt = json_decode((string) $req['body'], true)['external_order_id'];
+            return jsonResponse(201, array('withdrawal_id' => 'wd_rf_870', 'status' => 'signed'));
+        }
+        if ($req['method'] === 'GET' && $path === '/v1/refunds/wd_rf_870') {
+            return jsonResponse(200, array('withdrawal_id' => 'wd_rf_870', 'invoice_id' => 'inv_rf_870', 'project_id' => 'prj_sandbox_blesta_001', 'is_test' => true, 'mode' => 'full', 'external_order_id' => $lastExt, 'status' => 'signed', 'amount' => '49.9', 'currency' => 'USDT', 'network' => 'arbitrum', 'first_sender' => '0xsender870'));
+        }
+        if ($req['method'] === 'GET' && $path === '/v1/invoices/inv_rf_870') {
+            return jsonResponse(200, sandboxInvoice('inv_rf_870', 'blesta_inv_870_r0', 'paid', '49.90', array('refund_summary' => array('can_refund_full' => true, 'can_refund_overpayment' => false, 'full_refund_amount' => '49.9', 'overpayment_refund_amount' => null))));
+        }
+        throw new \RuntimeException('Unexpected request: ' . $req['method'] . ' ' . $path);
+    });
+    $gw = makeGateway($db, $transport, $clock);
+    $gw->setRefundNativeHandler($native);
+    assertSame(null, $gw->refund('inv_rf_870', '0xtx870', '49.90'));
+    assertSame(1, $posts);
+    $intents = (new RefundIntentStore($db, $credStore, $clock))->forPayment('870');
+    assertSame(RefundStates::FAILED, $intents[0]->cashState(), 'The first refund failed.');
+
+    assertSame(null, $gw->refund('inv_rf_870', '0xtx870', '49.90'));
+    assertSame(2, $posts, 'Pressing Refund again must send a new refund request.');
+    assertSame(null, $gw->refund('inv_rf_870', '0xtx870', '49.90'));
+    assertSame(2, $posts, 'While the new refund is in progress the button reuses it.');
+});
+
+runTest('8.19 CMSP-36: the Appcontroller.structure hook registers nothing', function () {
+    assertSame(array(), (new PaymosPlugin())->getEvents(), 'No events are registered.');
+});
+
+// ── Group 9: Independent review of the audit fixes (R-plugins-01..08) ──────────
+
+/**
+ * Blesta staff ACL (StaffGroups / Permissions / PluginManager) of one company.
+ */
+final class FakeBlestaAcl
+{
+    /** @var bool */
+    public $permissionsRegistered = true;
+    /** @var array<int, int> */
+    public $groups = array(3, 4, 5);
+    /** @var array<int, array<int, int>> */
+    public $grants = array();
+    /** @var array<string, bool> "staff_group_<id>|<aco>" */
+    public $allowed = array();
+    /** @var array<int, array<int, mixed>> */
+    public $deletedEvents = array();
+    /** @var array<int, int> staff id => group id */
+    public $staffGroupOf = array(7 => 3, 8 => 4);
+
+    public function install(): void
+    {
+        $acl = $this;
+        Loader::$models['Permissions'] = new class($acl) {
+            private $acl;
+            public function __construct(FakeBlestaAcl $acl) { $this->acl = $acl; }
+            public function getByAlias($alias, $pluginId = null, $action = null) { return $this->acl->permissionsRegistered ? (object) array('id' => 1, 'alias' => $alias, 'plugin_id' => $pluginId) : false; }
+            public function authorized($aro, $aco, $action, $level, $companyId) { return !empty($this->acl->allowed[$aro . '|' . $aco]); }
+        };
+        Loader::$models['StaffGroups'] = new class($acl) {
+            private $acl;
+            public function __construct(FakeBlestaAcl $acl) { $this->acl = $acl; }
+            public function getAll($companyId) { return array_map(static fn (int $id) => (object) array('id' => $id, 'company_id' => $companyId), $this->acl->groups); }
+            public function getStaffGroupByStaff($staffId, $companyId) { return isset($this->acl->staffGroupOf[(int) $staffId]) ? (object) array('id' => $this->acl->staffGroupOf[(int) $staffId]) : false; }
+            public function grantPermission($staffGroupId, $pluginId): void
+            {
+                $this->acl->grants[] = array((int) $staffGroupId, (int) $pluginId);
+                if ($this->acl->permissionsRegistered) {
+                    foreach (array('paymos.admin_connect', 'paymos.admin_refunds') as $aco) {
+                        $this->acl->allowed['staff_group_' . (int) $staffGroupId . '|' . $aco] = true;
+                    }
+                }
+            }
+            public function errors() { return false; }
+        };
+        Loader::$models['PluginManager'] = new class($acl) {
+            private $acl;
+            public function __construct(FakeBlestaAcl $acl) { $this->acl = $acl; }
+            public function getByDir($dir, $companyId = null) { return $dir === 'paymos' ? array((object) array('id' => 12, 'dir' => 'paymos')) : array(); }
+            public function deleteEvent($pluginId, $event): void { $this->acl->deletedEvents[] = array((int) $pluginId, (string) $event); }
+        };
+    }
+}
+
+runTest('9.1 R-plugins-01: installs of 1.0.0 still find a no-op injectAdminHelpers until upgrade drops the event', function () {
+    $prev = Loader::$models;
+    try {
+        $plugin = new PaymosPlugin();
+        $plugin->setDbDriver(new InMemoryDbDriver());
+        $event = new class {
+            public $ret = array('head' => array('existing'));
+            public function getParams(): array { return array('portal' => 'client', 'controller' => 'client_pay'); }
+            public function getReturnValue(): array { return $this->ret; }
+            public function setReturnValue(array $v): void { $this->ret = $v; }
+        };
+        // Blesta dispatches the stored 1.0.0 callback array('this', 'injectAdminHelpers').
+        call_user_func(array($plugin, 'injectAdminHelpers'), $event);
+        assertSame(array('head' => array('existing')), $event->ret, 'The leftover handler must change nothing.');
+
+        $acl = new FakeBlestaAcl();
+        $acl->install();
+        $plugin->upgrade('1.0.0', 12);
+        assertSame(array(array(12, 'Appcontroller.structure')), $acl->deletedEvents, 'Upgrade removes the old event registration.');
+    } finally {
+        Loader::$models = $prev;
+    }
+});
+
+runTest('9.2 R-plugins-02: no staff group loses Paymos access on upgrade; the ACL turns on only once the permissions are granted', function () {
+    $prev = Loader::$models;
+    $prevSession = $_SESSION ?? null;
+    $_SESSION['blesta_staff_id'] = 7;
+    try {
+        // Permissions not registered yet when upgrade() runs: nothing granted, nothing marked, no lockout.
+        $acl = new FakeBlestaAcl();
+        $acl->install();
+        $acl->permissionsRegistered = false;
+        $db = new InMemoryDbDriver();
+        $plugin = new PaymosPlugin();
+        $plugin->setDbDriver($db);
+        $plugin->upgrade('1.0.4', 12);
+        assertSame(false, StaffPermissions::isGranted(new CredentialStore($db)), 'Nothing was granted, so nothing may be marked.');
+
+        AppController::$aclCheck = static fn (string $aco): bool => !empty($acl->allowed['staff_group_3|' . $aco]);
+        $page = new AdminRefunds();
+        $page->setDbDriver($db);
+        $page->plugin = 'paymos';
+        $page->controller = 'admin_refunds';
+        $page->action = 'index';
+        $page->preAction();
+        assertSame(0, $page->requireLoginCalls, 'While the permissions cannot be granted the page keeps its earlier access.');
+
+        // Blesta registered them later: the next admin request grants every staff group, then enforces.
+        $acl->permissionsRegistered = true;
+        $page2 = new AdminRefunds();
+        $page2->setDbDriver($db);
+        $page2->plugin = 'paymos';
+        $page2->controller = 'admin_refunds';
+        $page2->action = 'index';
+        $page2->preAction();
+        assertSame(array(array(3, 12), array(4, 12), array(5, 12)), $acl->grants, 'Every staff group that could open Paymos before keeps it.');
+        assertSame(true, StaffPermissions::isGranted(new CredentialStore($db)));
+        assertSame(1, $page2->requireLoginCalls);
+
+        // Permissions registered before upgrade() (Blesta 5/6 order): granted during upgrade, once.
+        $acl2 = new FakeBlestaAcl();
+        $acl2->install();
+        $db2 = new InMemoryDbDriver();
+        $plugin2 = new PaymosPlugin();
+        $plugin2->setDbDriver($db2);
+        $plugin2->upgrade('1.0.4', 12);
+        $plugin2->upgrade('1.0.5', 12);
+        assertSame(array(array(3, 12), array(4, 12), array(5, 12)), $acl2->grants, 'Granted once; later upgrades keep staff group settings.');
+    } finally {
+        AppController::$aclCheck = null;
+        Loader::$models = $prev;
+        if ($prevSession === null) {
+            unset($_SESSION['blesta_staff_id']);
+        } else {
+            $_SESSION = $prevSession;
+        }
+    }
+});
+
+runTest('9.3 R-plugins-03: each Paymos payment of an invoice is refunded on its own; none blocks another', function () {
+    $db = new InMemoryDbDriver();
+    $now = 1764200000;
+    $clock = static fn (): int => $now;
+    $credStore = new CredentialStore($db, null, $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    $payments = array(
+        'inv_pay_A' => array('external_order_id' => 'blesta_inv_880_r0', 'platform_ref' => 'inv_880', 'blesta_invoice_id' => 880, 'amount' => '40', 'renewal_attempt' => 0, 'meta' => array(array('id' => 880, 'amount' => '40')), 'tx' => '9001'),
+        'inv_pay_C' => array('external_order_id' => 'blesta_inv_880_r1', 'platform_ref' => 'inv_880', 'blesta_invoice_id' => 880, 'amount' => '60', 'renewal_attempt' => 1, 'meta' => array(array('id' => 880, 'amount' => '60')), 'tx' => '9003'),
+        'inv_pay_B' => array('external_order_id' => 'blesta_inv_880_881_r0', 'platform_ref' => 'inv_880_881', 'blesta_invoice_id' => null, 'amount' => '50', 'renewal_attempt' => 0, 'meta' => array(array('id' => 880, 'amount' => '20'), array('id' => 881, 'amount' => '30')), 'tx' => '9002'),
+    );
+    $txs = array();
+    foreach ($payments as $paymosId => $p) {
+        seedSnapshot($snapshots, array(
+            'external_order_id' => $p['external_order_id'],
+            'paymos_invoice_id' => $paymosId,
+            'platform_ref' => $p['platform_ref'],
+            'blesta_invoice_id' => $p['blesta_invoice_id'],
+            'client_id' => '90',
+            'payload_meta' => json_encode(array('invoices' => $p['meta'])),
+            'amount' => $p['amount'],
+            'transaction_id' => '0x' . $paymosId,
+            'status' => 'paid',
+            'final_status' => 'paid',
+            'renewal_attempt' => $p['renewal_attempt'],
+        ));
+        $txs[$p['tx']] = array('id' => $p['tx'], 'client_id' => '90', 'transaction_id' => '0x' . $paymosId, 'reference_id' => $paymosId, 'amount' => $p['amount'], 'currency' => 'USD', 'status' => 'approved', 'notes' => '');
+    }
+    $edits = array();
+    $native = function (string $cmd, array $input) use (&$txs, &$edits, $snapshots, $payments): array {
+        if ($cmd === 'snapshot') {
+            $mapping = isset($input['paymos_invoice_id'])
+                ? $snapshots->findByInvoiceId((string) $input['paymos_invoice_id'])
+                : $snapshots->findPaidByBlestaInvoiceId((int) $input['invoice_id']);
+            return array(
+                'invoice' => array('id' => (int) $input['invoice_id'], 'client_id' => '90', 'status' => 'active', 'total' => '100', 'currency' => 'USD'),
+                'transaction' => is_array($mapping) ? $txs[$payments[$mapping['paymos_invoice_id']]['tx']] : array(),
+                'mapping' => $mapping,
+            );
+        }
+        if ($cmd === 'marker') {
+            $tx = $txs[(string) $input['transaction_id']] ?? null;
+            return ($tx !== null && $tx['status'] === 'refunded' && strpos($tx['notes'], (string) $input['marker']) !== false) ? array($tx) : array();
+        }
+        if ($cmd === 'Transactions::edit') {
+            $id = (string) $input['transaction_id'];
+            $edits[] = $id;
+            $txs[$id]['status'] = $input['vars']['status'];
+            $txs[$id]['notes'] = $input['vars']['notes'];
+            return array('result' => 'success');
+        }
+        return array();
+    };
+    $exts = array();
+    $transport = new SpyTransport(function (array $req) use (&$exts, $payments): HttpResponse {
+        $path = (string) parse_url($req['url'], PHP_URL_PATH);
+        if ($req['method'] === 'POST' && $path === '/v1/refunds') {
+            $body = json_decode((string) $req['body'], true);
+            $exts[$body['invoice_id']] = $body['external_order_id'];
+            return jsonResponse(201, array('withdrawal_id' => 'wd_' . $body['invoice_id'], 'status' => 'completed'));
+        }
+        if (strncmp($path, '/v1/refunds/wd_', 15) === 0) {
+            $paymosId = substr($path, 15);
+            return jsonResponse(200, array('withdrawal_id' => 'wd_' . $paymosId, 'invoice_id' => $paymosId, 'project_id' => 'prj_sandbox_blesta_001', 'is_test' => true, 'mode' => 'full', 'external_order_id' => $exts[$paymosId], 'status' => 'completed', 'amount' => $payments[$paymosId]['amount'], 'currency' => 'USDT', 'network' => 'arbitrum', 'first_sender' => '0xsender'));
+        }
+        if (strncmp($path, '/v1/invoices/inv_pay_', 21) === 0) {
+            $paymosId = substr($path, 13);
+            return jsonResponse(200, sandboxInvoice($paymosId, $payments[$paymosId]['external_order_id'], 'paid', $payments[$paymosId]['amount'], array('refund_summary' => array('can_refund_full' => true, 'can_refund_overpayment' => false, 'full_refund_amount' => $payments[$paymosId]['amount'], 'overpayment_refund_amount' => null))));
+        }
+        if ($path === '/v1/refunds') {
+            return jsonResponse(200, array('items' => array(), 'next_cursor' => null));
+        }
+        throw new \RuntimeException('Unexpected request: ' . $req['method'] . ' ' . $path);
+    });
+
+    $controller = new AdminRefunds();
+    $controller->setDbDriver($db);
+    $controller->setClock($clock);
+    $controller->setMeta(array('mode' => 'sandbox'));
+    $controller->setClientFactory(static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport));
+    $controller->setRefundNativeHandler($native);
+    $controller->setStaffAuthenticator(static fn (): bool => true);
+    $controller->setCsrfVerifier(static fn (string $t): bool => $t === 'csrf_ok');
+    $byPayment = static function (array $panelBody): array {
+        $out = array();
+        foreach ($panelBody['payments'] ?? array() as $payment) {
+            $out[$payment['paymos_invoice_id']] = $payment;
+        }
+        return $out;
+    };
+    $submit = static function (string $invoiceId, ?string $paymosInvoiceId = null) use ($controller): array {
+        $post = array('_csrf_token' => 'csrf_ok', 'invoice_id' => $invoiceId, 'mode' => 'full', 'request_token' => CredentialStore::uuidV4());
+        if ($paymosInvoiceId !== null) {
+            $post['paymos_invoice_id'] = $paymosInvoiceId;
+        }
+        return $controller->handleSubmitRequest('POST', $post);
+    };
+
+    // #881 is covered only by B: the refund goes to B's transaction, not to A of invoice #880.
+    $p881 = $byPayment($controller->handlePanelRequest(881, 'en_us')['body']);
+    assertSame(array('inv_pay_B'), array_keys($p881));
+    $resB = $submit('881');
+    assertSame(200, $resB['http_status'], 'Refund of B failed: ' . json_encode($resB['body']));
+    assertSame(array('9002'), $edits);
+
+    // #880 has three payments; each is offered on its own.
+    $p880 = $byPayment($controller->handlePanelRequest(880, 'en_us')['body']);
+    assertSame(array('inv_pay_A', 'inv_pay_B', 'inv_pay_C'), (static function (array $k): array { sort($k); return $k; })(array_keys($p880)));
+    assertSame(false, $p880['inv_pay_B']['can_refund_full'], 'B is already refunded.');
+    assertSame(true, $p880['inv_pay_A']['can_refund_full']);
+    assertSame(true, $p880['inv_pay_C']['can_refund_full']);
+
+    $ambiguous = $submit('880');
+    assertSame(400, $ambiguous['http_status'], 'With several payments the admin must pick one.');
+    assertSame('refund_payment_selection_required', $ambiguous['body']['reason'] ?? null);
+
+    $resC = $submit('880', 'inv_pay_C');
+    assertSame(200, $resC['http_status'], 'Refund of C failed: ' . json_encode($resC['body']));
+    assertSame(array('9002', '9003'), $edits);
+
+    // The native Refund button of A's transaction still works after C was refunded in full.
+    $gw = makeGateway($db, $transport, $clock);
+    $gw->setRefundNativeHandler($native);
+    $nativeA = $gw->refund('inv_pay_A', '0xinv_pay_A', '40');
+    assertSame('refunded', $nativeA['status'] ?? null, 'A must stay refundable: ' . json_encode($gw->errors()));
+    assertSame(array('9002', '9003', '9001'), $edits);
+});
+
+runTest('9.4 R-plugins-05: while Blesta has not recorded a paid Paymos invoice, the buyer gets the same checkout, not a second invoice', function () {
+    $db = new InMemoryDbDriver();
+    $store = new CredentialStore($db);
+    $store->saveCredentials(sampleCredentials());
+    $config = Config::fromStore(array('mode' => 'sandbox'), $store);
+    $snapshots = new SnapshotStore($db);
+    $posts = 0;
+    $transport = new SpyTransport(function (array $req) use (&$posts): HttpResponse {
+        $posts++;
+        $id = 'inv_wait_' . $posts;
+        return jsonResponse(201, array('invoice_id' => $id, 'payment_url' => 'https://checkout.paymos.io/inv/' . $id, 'status' => 'awaiting_client'));
+    });
+    $known = false;
+    $checkout = new CheckoutService(
+        $config,
+        $snapshots,
+        static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport),
+        null,
+        null,
+        null,
+        static function (string $transactionId) use (&$known): ?bool {
+            return $known;
+        }
+    );
+    $first = $checkout->createCheckout('9', '40.00', 'USD', array(array('id' => 905, 'amount' => '40.00')));
+    $snapshots->updateStatus($first['paymos_invoice_id'], 'paid', '0xwait905');
+
+    $again = $checkout->createCheckout('9', '40.00', 'USD', array(array('id' => 905, 'amount' => '40.00')));
+    assertSame(true, $again['reused'], 'The paid invoice is shown again while Blesta lacks its transaction.');
+    assertSame($first['payment_url'], $again['payment_url']);
+    assertSame(1, $posts);
+
+    $known = true;
+    $next = $checkout->createCheckout('9', '40.00', 'USD', array(array('id' => 905, 'amount' => '40.00')));
+    assertSame('blesta_inv_905_r1', $next['external_order_id'], 'Once Blesta holds the payment the rest of the invoice is payable.');
+    assertSame(2, $posts);
+});
+
+runTest('9.5 R-plugins-06: a later invoice.paid for a payment Blesta already holds is not handed over again', function () {
+    $db = new InMemoryDbDriver();
+    $now = 1764210000;
+    $clock = static fn (): int => $now;
+    $credStore = new CredentialStore($db, null, $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    $paid = sandboxInvoice('inv_known_910', 'blesta_inv_910_r0', 'paid', '25', array('payment' => array('tx_hash' => '0xknown910')));
+    $transport = new SpyTransport(static fn (): HttpResponse => jsonResponse(200, $paid));
+    foreach (array('known' => true, 'unknown' => null) as $case => $lookup) {
+        $db->tables[SnapshotStore::TABLE] = array();
+        seedSnapshot($snapshots, array(
+            'external_order_id' => 'blesta_inv_910_r0',
+            'paymos_invoice_id' => 'inv_known_910',
+            'platform_ref' => 'inv_910',
+            'blesta_invoice_id' => 910,
+            'amount' => '25',
+            'transaction_id' => '0xknown910',
+            'status' => 'paid',
+            'final_status' => 'paid',
+        ));
+        $processor = new CallbackProcessor(
+            Config::fromStore(array('mode' => 'sandbox'), $credStore),
+            $snapshots,
+            new PdoEventStore($db, $clock),
+            static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport),
+            static fn (): array => array('paid' => false, 'amount' => '25', 'currency' => 'USD'),
+            null,
+            null,
+            $clock,
+            null,
+            null,
+            static fn (string $txId): ?bool => $lookup
+        );
+        $body = invoiceWebhook('evt_reorg_910_' . $case, 'invoice.paid', $paid, $now);
+        $res = $processor->handle($body, signWebhook($body, 'whsec_sandbox_blesta_secret_001', $now));
+        assertSame(200, $res['http_status']);
+        assertSame(null, $res['transaction'], 'No replay when Blesta holds the transaction or it cannot be checked (' . $case . ').');
+    }
+    $meta = SnapshotStore::decodeMeta($snapshots->findByInvoiceId('inv_known_910')['payload_meta']);
+    assertTrue(empty($meta['blesta_transaction_confirmed']), 'An unknown answer confirms nothing.');
+});
+
+runTest('9.6 R-plugins-07: a refused replay never overwrites a key another request already bound', function () {
+    $db = new InMemoryDbDriver();
+    $now = 1764220000;
+    $clock = static fn (): int => $now;
+    $store = new CredentialStore($db, null, $clock);
+    $store->saveCredentials(sampleCredentials());
+    $config = Config::fromStore(array('mode' => 'sandbox'), $store);
+    $snapshots = new SnapshotStore($db, $clock);
+    $step = 0;
+    $transport = new SpyTransport(function (array $req) use (&$step, $db, $now): HttpResponse {
+        $step++;
+        if ($req['method'] === 'POST' && $step === 1) {
+            throw new \RuntimeException('Paymos HTTP error: connection reset');
+        }
+        if ($req['method'] === 'POST') {
+            // A parallel request (double click) bound the key while this replay was in flight.
+            $db->tables[SnapshotStore::TABLE]['blesta_inv_915_r0']['paymos_invoice_id'] = 'inv_bound_915';
+            $db->tables[SnapshotStore::TABLE]['blesta_inv_915_r0']['payment_url'] = 'https://checkout.paymos.io/inv/inv_bound_915';
+            $db->tables[SnapshotStore::TABLE]['blesta_inv_915_r0']['status'] = 'awaiting_client';
+            return new HttpResponse(409, (string) json_encode(array('type' => 'about:blank', 'title' => 'Conflict', 'status' => 409, 'detail' => 'Conflict.', 'code' => 'invoice_idempotency_conflict')), array('Content-Type' => 'application/problem+json'));
+        }
+        return jsonResponse(200, sandboxInvoice('inv_bound_915', 'blesta_inv_915_r0', 'awaiting_client', '30', array('expires_at' => $now + 1200)));
+    });
+    $checkout = new CheckoutService($config, $snapshots, static fn (Config $c, string $e): Client => new Client($c->clientConfig($e), $transport), null, $clock);
+    assertThrows(\RuntimeException::class, static fn () => $checkout->createCheckout('9', '30.00', 'USD', array(array('id' => 915, 'amount' => '30.00'))));
+    $res = $checkout->createCheckout('9', '30.00', 'USD', array(array('id' => 915, 'amount' => '30.00')));
+    $row = $snapshots->findByExternalOrderId('blesta_inv_915_r0');
+    assertSame('inv_bound_915', $row['paymos_invoice_id'], 'The binding of the parallel request must survive.');
+    assertSame('awaiting_client', $row['status']);
+    assertSame('inv_bound_915', $res['paymos_invoice_id']);
+});
+
+runTest('9.7 R-plugins-08: a staff group without the permission gets JSON 403 on JSON endpoints, not a redirect', function () {
+    $prev = Loader::$models;
+    $prevSession = $_SESSION ?? null;
+    $_SESSION['blesta_staff_id'] = 8;
+    try {
+        $acl = new FakeBlestaAcl();
+        $acl->install();
+        $db = new InMemoryDbDriver();
+        StaffPermissions::markGranted(new CredentialStore($db));
+
+        $refunds = new AdminRefunds();
+        $refunds->setDbDriver($db);
+        $refunds->plugin = 'paymos';
+        $refunds->controller = 'admin_refunds';
+        $refunds->action = 'submit';
+        $refunds->setCsrfVerifier(static fn (string $t): bool => true);
+        $refunds->preAction();
+        assertSame(0, $refunds->requireLoginCalls, 'JSON endpoints must not answer with the Blesta login redirect.');
+        $denied = $refunds->handleSubmitRequest('POST', array('_csrf_token' => 'ok', 'invoice_id' => '1', 'mode' => 'full', 'request_token' => CredentialStore::uuidV4()));
+        assertSame(403, $denied['http_status']);
+        assertSame('paymos_admin_access_denied', $denied['body']['reason'] ?? null);
+
+        $connect = new AdminConnect();
+        $connect->setDbDriver($db);
+        $connect->plugin = 'paymos';
+        $connect->controller = 'admin_connect';
+        $connect->action = 'start';
+        $connect->setCsrfVerifier(static fn (string $t): bool => true);
+        $connect->preAction();
+        assertSame(0, $connect->requireLoginCalls);
+        $deniedConnect = $connect->handleRequest('POST', array('action' => 'invalid', '_csrf_token' => 'ok'));
+        assertSame(403, $deniedConnect['http_status']);
+        assertSame('paymos_admin_access_denied', $deniedConnect['body']['reason'] ?? null);
+
+        // A permitted group passes the same check.
+        $acl->allowed['staff_group_4|paymos.admin_connect'] = true;
+        $allowedConnect = $connect->handleRequest('POST', array('action' => 'invalid', '_csrf_token' => 'ok'));
+        assertSame(400, $allowedConnect['http_status'], 'Granted staff reach the action itself.');
+    } finally {
+        Loader::$models = $prev;
+        if ($prevSession === null) {
+            unset($_SESSION['blesta_staff_id']);
+        } else {
+            $_SESSION = $prevSession;
+        }
+    }
 });
 
 echo "\nBlesta test summary: {$passed} passed, {$failed} failed.\n";

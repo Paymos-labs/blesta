@@ -6,6 +6,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-11-28
+
+- fix(blesta): cron task, staff permissions, partial payments, refunds
+
+### Added
+- Staff permissions **Paymos → Connect Paymos / Paymos Refunds** (`getPermissionGroups()`, `getPermissions()`), enforced by `requireLogin()` on admin pages and as JSON `403` on the Connect and refund endpoints. Before, every staff member could open these pages, so on upgrade every staff group of the company is granted them once (narrow access under **Staff → Groups**); until that grant succeeds the pages keep their earlier access.
+- Companion plugin locales `ru_ru`, `de_de`, `es_es`, `tr_tr`, `zh_cn` (`plugins/paymos/language/`).
+
+### Fixed
+- **Cron task registration (`PaymosPlugin`):** the `paymos_reconcile` task is registered with `task_type`/`dir`/`is_lang` as `CronTasks::add()` documents (the Automation list showed raw language keys), add/run failures are logged, upgrade repairs older tasks, and uninstall removes this company's task run via `getTaskRunByKey()`.
+- **Partial payments and "Other Payment Amount" (`Paymos::buildProcess()`, `CallbackProcessor`):** the amount due at checkout is stored, so a payment of part of an invoice, or with extra account credit, is recorded with Blesta's per-invoice amounts instead of being held for manual review.
+- **One payment recorded once (`CallbackProcessor`, `SnapshotStore`, cron applier):** the webhook and the cron reconciler share a lock per Paymos invoice and re-read the snapshot under it; the cron applier skips a transaction Blesta already has, and a rejected `Transactions::add()` keeps the snapshot retryable instead of marking it paid. A redelivered payment event hands Blesta the same transaction again only while Blesta does not hold it (a failed delivery); a transaction Blesta knows is never overwritten.
+- **"Already paid in Blesta" guard (`CallbackProcessor`):** non-payment events no longer write `paid` into the snapshot; a real Paymos payment for an invoice already closed another way is flagged for manual review.
+- **`paid_late` and manual review are visible (`CallbackProcessor`):** each leaves one sticky client note (`Clients::addNote`) in the store language.
+- **Checkout recovery (`CheckoutService`):** a create refused for good (4xx other than 408/429) is closed as `create_failed` and the next attempt sends the current amount with a new key; a passed local `expires_at` is re-read from Paymos instead of blocking the buyer; a paid Paymos invoice is never reused, so a second top-up or the rest of a partly paid invoice gets a new invoice, unless Blesta has not stored that payment yet (the buyer then gets the same checkout); a refused replay never overwrites a key another request bound meanwhile; a final invoice returned for a never-used key is not bound; a zero-price line item no longer drops `products[]`.
+- **Snapshot status (`SnapshotStore::updateStatus()`):** a late non-final status no longer overwrites a recorded final status.
+- **Refunds (`RefundAdapter`, `SnapshotStore`):** each Paymos payment of an invoice (part payments, a payment of several invoices) is refunded on its own and none blocks another; a credit-only payment explains that it is refunded in the Paymos Dashboard; the native Refund button can retry after a failed refund.
+- **Admin URLs (`Config::adminUri()`, controllers):** Connect and refund URLs keep the Blesta web directory (subfolder installs, no mod_rewrite).
+- **Admin texts (`AdminRefunds`, `AdminConnect`):** refunds page labels and admin errors are localized; error responses carry the text plus a `reason` code.
+
+### Removed
+- The `Appcontroller.structure` hook: `injectAdminHelpers()` is now an empty handler kept for 1.0.0 installs, and upgrade removes the event.
+
 ## [1.0.4] - 2026-11-27
 
 - chore: rebuild canonical CMS package

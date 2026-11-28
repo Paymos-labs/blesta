@@ -32,6 +32,14 @@ class AdminRefunds extends PaymosController
         $this->refundNativeHandler = $handler;
     }
 
+    /**
+     * panel() and submit() are fetch() endpoints of the refunds page; index() is the page.
+     */
+    protected function respondsWithJson(): bool
+    {
+        return isset($this->action) && in_array($this->action, array('panel', 'submit'), true);
+    }
+
     public function index()
     {
         $invoiceId = $this->resolveInvoiceIdFromRequest();
@@ -68,9 +76,10 @@ class AdminRefunds extends PaymosController
         try {
             $this->requireStaffAuth();
         } catch (\Throwable $authError) {
+            $denied = $this->adminErrorBody($authError->getMessage());
             return array(
                 'http_status' => 403,
-                'html' => '<div class="paymos-refunds-page"><p class="error">' . $e($authError->getMessage()) . '</p></div>',
+                'html' => '<div class="paymos-refunds-page"><p class="error">' . $e($denied['error']) . '</p></div>',
                 'panel' => null,
                 'error' => $authError->getMessage(),
             );
@@ -88,7 +97,8 @@ class AdminRefunds extends PaymosController
                 $adapter = $this->createRefundAdapter(false);
                 $panel = $adapter->panel($invoiceId, $lang);
             } catch (\Throwable $eObj) {
-                $error = Config::sanitizeStatic($eObj->getMessage());
+                $error = Translation::text('Paymos.!error.refund.failed', $lang)
+                    . ' (' . Config::sanitizeStatic($eObj->getMessage()) . ')';
             }
         }
 
@@ -102,12 +112,15 @@ class AdminRefunds extends PaymosController
 
         $html = '<div id="paymos-refunds-page" class="paymos-refunds-page"'
             . ' data-submit-url="' . $e($submitUrl) . '"'
-            . ' data-csrf-token="' . $e($csrfToken) . '">';
+            . ' data-csrf-token="' . $e($csrfToken) . '"'
+            . ' data-text-status="' . $e(Translation::text('Paymos.refunds.submit_status', $lang)) . '"'
+            . ' data-text-failed="' . $e(Translation::text('Paymos.!error.refund.failed', $lang)) . '"'
+            . ' data-text-network="' . $e(Translation::text('Paymos.refunds.network_error', $lang)) . '">';
         $html .= '<h3>' . $e(Translation::text('Paymos.refunds.title', $lang)) . '</h3>';
         $html .= '<form method="get" action="' . $e($indexUrl) . '" class="paymos-refunds-lookup">';
-        $html .= '<label for="paymos-invoice-id">Blesta Invoice ID</label> ';
+        $html .= '<label for="paymos-invoice-id">' . $e(Translation::text('Paymos.refunds.lookup_label', $lang)) . '</label> ';
         $html .= '<input type="number" min="1" id="paymos-invoice-id" name="invoice_id" value="' . ($invoiceId > 0 ? $invoiceId : '') . '" required /> ';
-        $html .= '<button type="submit" class="btn btn-primary">Load</button>';
+        $html .= '<button type="submit" class="btn btn-primary">' . $e(Translation::text('Paymos.refunds.lookup_submit', $lang)) . '</button>';
         $html .= '</form>';
 
         if ($error !== null) {
@@ -138,7 +151,8 @@ class AdminRefunds extends PaymosController
                     continue;
                 }
                 $statusLabel = (string) ($snap['final_status'] ?? $snap['status'] ?? 'paid');
-                $html .= '<li><a href="' . $e($indexUrl . '?invoice_id=' . $blestaId) . '">Invoice #' . $blestaId
+                $html .= '<li><a href="' . $e($indexUrl . '?invoice_id=' . $blestaId) . '">'
+                    . $e(strtr(Translation::text('Paymos.refunds.recent_invoice', $lang), array('{id}' => (string) $blestaId)))
                     . ' (' . $e((string) ($snap['amount'] ?? '')) . ' ' . $e((string) ($snap['currency'] ?? ''))
                     . ' — ' . $e($statusLabel) . ')</a></li>';
             }
@@ -149,21 +163,25 @@ class AdminRefunds extends PaymosController
             . 'var root=document.getElementById("paymos-refunds-page");if(!root){return;}'
             . 'var submitUrl=root.getAttribute("data-submit-url")||"";'
             . 'var csrf=root.getAttribute("data-csrf-token")||"";'
+            . 'var tStatus=root.getAttribute("data-text-status")||"";'
+            . 'var tFailed=root.getAttribute("data-text-failed")||"";'
+            . 'var tNetwork=root.getAttribute("data-text-network")||"";'
             . 'root.addEventListener("click",function(ev){'
             . 'var btn=ev.target&&ev.target.closest?ev.target.closest(".paymos-refund-btn"):null;'
             . 'if(!btn||btn.disabled){return;}'
             . 'var panel=btn.closest(".paymos-refunds-panel");'
             . 'var invId=panel?panel.getAttribute("data-invoice-id"):"";'
+            . 'var payId=panel?(panel.getAttribute("data-paymos-invoice-id")||""):"";'
             . 'var mode=btn.getAttribute("data-mode")||"";'
             . 'var token=btn.getAttribute("data-token")||"";'
             . 'var fb=document.getElementById("paymos-refund-feedback");'
             . 'if(!submitUrl||!invId||!mode||!token){return;}'
             . 'btn.disabled=true;'
-            . 'var body=new URLSearchParams({invoice_id:invId,mode:mode,request_token:token,_csrf_token:csrf});'
+            . 'var body=new URLSearchParams({invoice_id:invId,paymos_invoice_id:payId,mode:mode,request_token:token,_csrf_token:csrf});'
             . 'fetch(submitUrl,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":csrf},body:body.toString()})'
             . '.then(function(r){return r.json().then(function(d){return {ok:r.ok,data:d};});})'
-            . '.then(function(res){if(fb){fb.textContent=res.ok?("Refund "+res.data.mode+" status: "+res.data.cash_state):(res.data&&res.data.error?res.data.error:"Refund failed");}if(res.ok){window.location.reload();}else{btn.disabled=false;}})'
-            . '.catch(function(){if(fb){fb.textContent="Network error submitting refund.";}btn.disabled=false;});'
+            . '.then(function(res){if(fb){fb.textContent=res.ok?tStatus.replace("{status}",res.data.cash_state):(res.data&&res.data.error?res.data.error:tFailed);}if(res.ok){window.location.reload();}else{btn.disabled=false;}})'
+            . '.catch(function(){if(fb){fb.textContent=tNetwork;}btn.disabled=false;});'
             . '});})();</script>';
         $html .= '</div>';
 
@@ -219,26 +237,31 @@ class AdminRefunds extends PaymosController
         } catch (\Throwable $authError) {
             return array(
                 'http_status' => 403,
-                'body' => array('error' => $authError->getMessage()),
+                'body' => $this->adminErrorBody($authError->getMessage()),
             );
         }
 
+        $lang = Translation::normalizeLocale($locale ?? Translation::detectLocale());
         if ($invoiceId <= 0) {
             return array(
                 'http_status' => 400,
-                'body' => array('error' => 'A valid Blesta invoice_id is required.'),
+                'body' => array(
+                    'error' => Translation::text('Paymos.refunds.invoice_required', $lang),
+                    'reason' => 'refund_payment_key_invalid',
+                ),
             );
         }
 
         try {
             $adapter = $this->createRefundAdapter(false);
-            $panel = $adapter->panel($invoiceId, $locale ?? Translation::detectLocale());
+            $panel = $adapter->panel($invoiceId, $lang);
             return array('http_status' => 200, 'body' => $panel);
         } catch (\Throwable $error) {
             return array(
                 'http_status' => 400,
                 'body' => array(
-                    'error' => Config::sanitizeStatic($error->getMessage()),
+                    'error' => Translation::text('Paymos.!error.refund.failed', $lang),
+                    'reason' => Config::sanitizeStatic($error->getMessage()),
                 ),
             );
         }
@@ -256,7 +279,7 @@ class AdminRefunds extends PaymosController
         if (strtoupper($method) !== 'POST') {
             return array(
                 'http_status' => 405,
-                'body' => array('error' => 'POST request is required.'),
+                'body' => $this->adminErrorBody('paymos_method_not_allowed'),
             );
         }
 
@@ -266,7 +289,7 @@ class AdminRefunds extends PaymosController
         } catch (\Throwable $authError) {
             return array(
                 'http_status' => 403,
-                'body' => array('error' => $authError->getMessage()),
+                'body' => $this->adminErrorBody($authError->getMessage()),
             );
         }
 
@@ -296,6 +319,8 @@ class AdminRefunds extends PaymosController
                 $message .= ' ' . Translation::text('Paymos.refunds.reconnect_hint', $locale);
             } elseif ($reason === 'refund_partial_unsupported') {
                 $message = Translation::text('Paymos.!error.refund.partial_unsupported', $locale);
+            } elseif ($reason === 'refund_payment_selection_required') {
+                $message = Translation::text('Paymos.!error.refund.payment_selection_required', $locale);
             }
 
             $status = in_array($reason, array(
@@ -305,6 +330,7 @@ class AdminRefunds extends PaymosController
                 'refund_mode_invalid',
                 'refund_payment_key_invalid',
                 'refund_cash_only_input',
+                'refund_payment_selection_required',
             ), true) ? 400 : 409;
 
             return array(

@@ -8,6 +8,7 @@ require_once __DIR__ . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'Auto
 use Paymos\Client;
 use Paymos\Http\TransportInterface;
 use Paymos\Plugin\AmountGuard;
+use PaymosBlesta\BillingState;
 use PaymosBlesta\CallbackProcessor;
 use PaymosBlesta\CheckoutService;
 use PaymosBlesta\Config;
@@ -275,13 +276,24 @@ class Paymos extends NonmerchantGateway
             $clientId = isset($contact_info['client_id']) && is_scalar($contact_info['client_id'])
                 ? trim((string) $contact_info['client_id'])
                 : '';
+            $invoiceAmounts = is_array($invoice_amounts) ? $invoice_amounts : array();
+            $checkoutOptions = is_array($options) ? $options : array();
+            if (!isset($checkoutOptions['invoice_total'])) {
+                // Blesta lets the client pay part of an invoice or add account credit, so the
+                // amount may differ from what is due. Remember what was due at checkout: the
+                // webhook then records the payment unless the invoices themselves changed.
+                $dueAtCheckout = $this->dueTotalOf($invoiceAmounts);
+                if ($dueAtCheckout !== null) {
+                    $checkoutOptions['invoice_total'] = $dueAtCheckout;
+                }
+            }
 
             $checkout = $checkoutService->createCheckout(
                 $clientId,
                 $amount,
                 $this->currency !== '' ? $this->currency : 'USD',
-                is_array($invoice_amounts) ? $invoice_amounts : array(),
-                is_array($options) ? $options : array()
+                $invoiceAmounts,
+                $checkoutOptions
             );
         } catch (\Throwable $e) {
             $safeMessage = isset($checkoutService)
@@ -521,7 +533,8 @@ class Paymos extends NonmerchantGateway
             $this->buildClientFactory(),
             $this->resolveLineItemsCallback(),
             $this->clock,
-            $this->buildLogger($config)
+            $this->buildLogger($config),
+            CallbackProcessor::blestaTransactionLookup()
         );
     }
 
@@ -543,7 +556,9 @@ class Paymos extends NonmerchantGateway
             },
             null,
             $this->clock,
-            $this->buildLogger($config)
+            $this->buildLogger($config),
+            CallbackProcessor::blestaClientNoteWriter(),
+            CallbackProcessor::blestaTransactionLookup()
         );
     }
 
@@ -648,77 +663,16 @@ class Paymos extends NonmerchantGateway
         }
 
         return function (array $snapshot): array {
-            $meta = SnapshotStore::decodeMeta(isset($snapshot['payload_meta']) ? (string) $snapshot['payload_meta'] : null);
-            $invoices = isset($meta['invoices']) && is_array($meta['invoices']) ? $meta['invoices'] : array();
-            if (count($invoices) === 0) {
-                return array();
-            }
-
             try {
                 Loader::loadModels($this, array('Invoices'));
                 if (!isset($this->Invoices) || !is_object($this->Invoices) || !method_exists($this->Invoices, 'get')) {
                     return array();
                 }
+                $invoices = $this->Invoices;
 
-                $allPaid = true;
-                $currency = '';
-                $currencyMismatch = false;
-                $dueAmount = '0';
-                $loadedCount = 0;
-
-                foreach ($invoices as $item) {
-                    if (!isset($item['id'])) {
-                        continue;
-                    }
-                    $invoice = $this->Invoices->get((int) $item['id']);
-                    if (!is_object($invoice)) {
-                        $allPaid = false;
-                        continue;
-                    }
-                    $loadedCount++;
-                    $due = isset($invoice->due) ? AmountGuard::normalizeDecimal($invoice->due) : null;
-                    $isClosed = !empty($invoice->date_closed) || ($due !== null && ($due === '0' || $due[0] === '-'));
-                    if (!$isClosed) {
-                        $allPaid = false;
-                    }
-                    if (isset($invoice->currency) && is_string($invoice->currency)) {
-                        $invCurr = strtoupper(trim($invoice->currency));
-                        if ($invCurr !== '') {
-                            if ($currency === '') {
-                                $currency = $invCurr;
-                            } elseif ($currency !== $invCurr) {
-                                $currencyMismatch = true;
-                            }
-                        }
-                    }
-
-                    $rawBalance = isset($invoice->due) ? $invoice->due : (isset($invoice->total) ? $invoice->total : null);
-                    if ($rawBalance !== null) {
-                        $norm = AmountGuard::normalizeDecimal($rawBalance);
-                        if ($norm !== null) {
-                            $dueAmount = self::addDecimals($dueAmount, $norm);
-                        }
-                    }
-                }
-
-                if ($loadedCount === 0) {
-                    return array();
-                }
-
-                if ($currencyMismatch) {
-                    return array(
-                        'paid' => false,
-                        'amount' => $dueAmount,
-                        'currency' => '__CURRENCY_MISMATCH__',
-                    );
-                }
-
-                $normDue = AmountGuard::normalizeDecimal($dueAmount);
-                return array(
-                    'paid' => $allPaid,
-                    'amount' => $normDue !== null ? $normDue : (string) $snapshot['amount'],
-                    'currency' => $currency !== '' ? $currency : (string) $snapshot['currency'],
-                );
+                return BillingState::fromInvoices($snapshot, static function (int $id) use ($invoices) {
+                    return $invoices->get($id);
+                });
             } catch (\Throwable $e) {
                 return array();
             }
@@ -726,123 +680,48 @@ class Paymos extends NonmerchantGateway
     }
 
     /**
+     * Sum of `due` of the invoices a checkout pays, as Blesta reports it now; null when unknown.
+     *
+     * @param array<int, array<string, mixed>> $invoiceAmounts
+     */
+    private function dueTotalOf(array $invoiceAmounts): ?string
+    {
+        $invoices = array();
+        foreach ($invoiceAmounts as $entry) {
+            if (is_array($entry) && isset($entry['id']) && is_numeric($entry['id']) && (int) $entry['id'] > 0) {
+                $invoices[] = array('id' => (int) $entry['id']);
+            }
+        }
+        $resolver = count($invoices) > 0 ? $this->resolveBillingStateCallback() : null;
+        if ($resolver === null) {
+            return null;
+        }
+
+        try {
+            $state = call_user_func($resolver, array(
+                'payload_meta' => json_encode(array('invoices' => $invoices)),
+                'amount' => '',
+                'currency' => $this->currency,
+            ));
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        if (!is_array($state) || !empty($state['deleted']) || !empty($state['paid'])
+            || strtoupper(trim((string) ($state['currency'] ?? ''))) !== $this->currency) {
+            return null;
+        }
+
+        $due = AmountGuard::normalizeDecimal($state['amount'] ?? null);
+        return ($due !== null && $due !== '0' && $due[0] !== '-') ? $due : null;
+    }
+
+    /**
      * Exact arbitrary-precision decimal addition (no IEEE-754 float rounding).
      */
     public static function addDecimals(string $left, string $right): string
     {
-        $a = AmountGuard::normalizeDecimal($left);
-        $b = AmountGuard::normalizeDecimal($right);
-        if ($a === null || $b === null) {
-            throw new \InvalidArgumentException('Invalid decimal operand for exact addition.');
-        }
-
-        $aNeg = $a[0] === '-';
-        $bNeg = $b[0] === '-';
-        $aAbs = $aNeg ? substr($a, 1) : $a;
-        $bAbs = $bNeg ? substr($b, 1) : $b;
-
-        $aParts = explode('.', $aAbs, 2);
-        $bParts = explode('.', $bAbs, 2);
-        $aFrac = $aParts[1] ?? '';
-        $bFrac = $bParts[1] ?? '';
-        $scale = max(strlen($aFrac), strlen($bFrac));
-
-        $aInt = ltrim($aParts[0] . str_pad($aFrac, $scale, '0'), '0');
-        $bInt = ltrim($bParts[0] . str_pad($bFrac, $scale, '0'), '0');
-        $aInt = $aInt === '' ? '0' : $aInt;
-        $bInt = $bInt === '' ? '0' : $bInt;
-
-        if ($aNeg === $bNeg) {
-            $digits = self::addDigitStrings($aInt, $bInt);
-            $neg = $aNeg;
-        } else {
-            $cmp = self::compareDigitStrings($aInt, $bInt);
-            if ($cmp === 0) {
-                return '0';
-            }
-            if ($cmp > 0) {
-                $digits = self::subtractDigitStrings($aInt, $bInt);
-                $neg = $aNeg;
-            } else {
-                $digits = self::subtractDigitStrings($bInt, $aInt);
-                $neg = $bNeg;
-            }
-        }
-
-        if ($scale > 0) {
-            if (strlen($digits) <= $scale) {
-                $digits = str_pad($digits, $scale + 1, '0', STR_PAD_LEFT);
-            }
-            $splitPos = strlen($digits) - $scale;
-            $formatted = substr($digits, 0, $splitPos) . '.' . substr($digits, $splitPos);
-        } else {
-            $formatted = $digits;
-        }
-
-        $result = AmountGuard::normalizeDecimal(($neg ? '-' : '') . $formatted);
-        return $result !== null ? $result : '0';
-    }
-
-    private static function addDigitStrings(string $a, string $b): string
-    {
-        $i = strlen($a) - 1;
-        $j = strlen($b) - 1;
-        $carry = 0;
-        $out = '';
-
-        while ($i >= 0 || $j >= 0 || $carry > 0) {
-            $sum = $carry;
-            if ($i >= 0) {
-                $sum += ord($a[$i]) - 48;
-                $i--;
-            }
-            if ($j >= 0) {
-                $sum += ord($b[$j]) - 48;
-                $j--;
-            }
-            $out = (string) ($sum % 10) . $out;
-            $carry = (int) floor($sum / 10);
-        }
-
-        $trimmed = ltrim($out, '0');
-        return $trimmed === '' ? '0' : $trimmed;
-    }
-
-    private static function compareDigitStrings(string $a, string $b): int
-    {
-        $lenA = strlen($a);
-        $lenB = strlen($b);
-        if ($lenA !== $lenB) {
-            return $lenA < $lenB ? -1 : 1;
-        }
-        return strcmp($a, $b);
-    }
-
-    private static function subtractDigitStrings(string $larger, string $smaller): string
-    {
-        $i = strlen($larger) - 1;
-        $j = strlen($smaller) - 1;
-        $borrow = 0;
-        $out = '';
-
-        while ($i >= 0) {
-            $digit = (ord($larger[$i]) - 48) - $borrow;
-            if ($j >= 0) {
-                $digit -= (ord($smaller[$j]) - 48);
-                $j--;
-            }
-            if ($digit < 0) {
-                $digit += 10;
-                $borrow = 1;
-            } else {
-                $borrow = 0;
-            }
-            $out = (string) $digit . $out;
-            $i--;
-        }
-
-        $trimmed = ltrim($out, '0');
-        return $trimmed === '' ? '0' : $trimmed;
+        return BillingState::addDecimals($left, $right);
     }
 
     private function ensureStorageSchemasSafe(): void
@@ -871,15 +750,7 @@ class Paymos extends NonmerchantGateway
 
     private function buildConnectUrl(): string
     {
-        $adminUri = '/admin/';
-        if (class_exists('Configure') && method_exists('Configure', 'get')) {
-            $routeAdmin = \Configure::get('Route.admin');
-            if (is_scalar($routeAdmin) && trim((string) $routeAdmin) !== '') {
-                $adminUri = '/' . trim((string) $routeAdmin, '/') . '/';
-            }
-        }
-
-        return $adminUri . 'plugin/paymos/admin_connect/';
+        return Config::adminUri('plugin/paymos/admin_connect/', defined('WEBDIR') ? (string) WEBDIR : null);
     }
 
     private function resolveInstallationBaseUrl(): string

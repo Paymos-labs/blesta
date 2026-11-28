@@ -276,8 +276,10 @@ final class RefundIntentStore implements RefundIntentStoreInterface, RefundCandi
                 return $existing;
             }
 
+            // One Blesta invoice may hold several Paymos payments under the same key: only an
+            // intent of the same Paymos invoice blocks a new one.
             foreach ($this->forPayment($intent->paymentKey()) as $old) {
-                if ($this->blocksNewIntent($old)) {
+                if ($old->invoiceId() === $intent->invoiceId() && $this->blocksNewIntent($old)) {
                     throw new \RuntimeException('refund_payment_has_unresolved_intent');
                 }
             }

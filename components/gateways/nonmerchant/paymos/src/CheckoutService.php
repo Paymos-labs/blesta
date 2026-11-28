@@ -18,7 +18,18 @@ use Paymos\Plugin\StatusMapper;
 final class CheckoutService
 {
     public const STATUS_CREATING = 'creating';
+
+    /**
+     * A create the server refused for good (a 4xx other than 408/429), or answered with a
+     * final invoice this attempt never created. The server holds no payable invoice of ours
+     * for the key: the row is never replayed, read or cancelled; the next attempt cuts a new key.
+     */
+    public const STATUS_CREATE_FAILED = 'create_failed';
+
     public const MAX_PRODUCTS = 50;
+
+    /** Fresh keys tried in one checkout when the server answers with someone else's final invoice. */
+    private const MAX_FRESH_ATTEMPTS = 3;
 
     /** @var Config */
     private $config;
@@ -38,13 +49,22 @@ final class CheckoutService
     /** @var callable|null */
     private $logger;
 
+    /**
+     * function (string $transactionId): ?bool — whether Blesta stores the transaction of a
+     * recorded payment (see CallbackProcessor::blestaTransactionLookup()).
+     *
+     * @var callable|null
+     */
+    private $transactionLookup;
+
     public function __construct(
         Config $config,
         SnapshotStore $snapshots,
         ?callable $clientFactory = null,
         ?callable $lineItemsResolver = null,
         ?callable $clock = null,
-        ?callable $logger = null
+        ?callable $logger = null,
+        ?callable $transactionLookup = null
     ) {
         $this->config = $config;
         $this->snapshots = $snapshots;
@@ -54,6 +74,7 @@ final class CheckoutService
             return time();
         };
         $this->logger = $logger;
+        $this->transactionLookup = $transactionLookup;
     }
 
     /**
@@ -62,6 +83,37 @@ final class CheckoutService
     public static function isPendingIntent(array $row): bool
     {
         return isset($row['status']) && (string) $row['status'] === self::STATUS_CREATING;
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    public static function isFailedCreate(array $row): bool
+    {
+        return isset($row['status']) && (string) $row['status'] === self::STATUS_CREATE_FAILED;
+    }
+
+    /**
+     * A recorded completed payment (paid / paid_over). It is never reused for a new payment
+     * and never closed: the next payment of the same reference gets its own attempt.
+     *
+     * @param array<string, mixed> $row
+     */
+    private static function isCompletedPayment(array $row): bool
+    {
+        $recorded = (string) ($row['final_status'] ?? $row['status'] ?? '');
+        return StatusMapper::invoiceAction('', strtolower(trim($recorded))) === StatusMapper::ACTION_PAYMENT_COMPLETE;
+    }
+
+    /**
+     * A 4xx answer other than 408/429 refuses the request itself: the server made no
+     * invoice for it and the same request will be refused again. 408, 429, 5xx and
+     * transport errors leave the result unknown.
+     */
+    private static function isDefinitiveRejection(ApiException $e): bool
+    {
+        $status = $e->statusCode();
+        return $status >= 400 && $status < 500 && $status !== 408 && $status !== 429;
     }
 
     /**
@@ -105,7 +157,28 @@ final class CheckoutService
             $this->blockPaidLate($existing, 'Paymos invoice was paid late and requires manual review.');
         }
 
+        // A recorded payment Blesta has not stored yet (its delivery is being retried) keeps its
+        // checkout: a second invoice now would let the buyer pay the same amount twice.
+        if (is_array($existing) && self::isCompletedPayment($existing) && $this->paymentAwaitsBlesta($existing)) {
+            $this->log('checkout.payment_awaits_blesta', array(
+                'paymos_invoice_id' => (string) $existing['paymos_invoice_id'],
+            ), 'info');
+            return array(
+                'payment_url' => (string) $existing['payment_url'],
+                'paymos_invoice_id' => (string) $existing['paymos_invoice_id'],
+                'external_order_id' => (string) $existing['external_order_id'],
+                'amount' => $normalizedAmount,
+                'currency' => $normalizedCurrency,
+                'reused' => true,
+            );
+        }
+
+        // A completed payment or a refused create is history, not an invoice to reuse or close.
+        $startsNewAttempt = is_array($existing)
+            && (self::isFailedCreate($existing) || self::isCompletedPayment($existing));
+
         if (is_array($existing)
+            && !$startsNewAttempt
             && $this->snapshotMatches($existing, $normalizedAmount, $normalizedCurrency)
             && $this->keepsExistingInvoice($existing)) {
             return array(
@@ -118,26 +191,12 @@ final class CheckoutService
             );
         }
 
-        if (is_array($existing)) {
+        if (is_array($existing) && !$startsNewAttempt) {
             $this->closeBeforeReplacing($existing);
         }
 
         $renewAttempt = is_array($existing) ? ((int) ($existing['renewal_attempt'] ?? 0) + 1) : 0;
-        $externalOrderId = $this->buildExternalOrderId($platformRef, $renewAttempt);
         $products = $this->extractProducts($invoices, $normalizedCurrency, $options);
-
-        $payload = array(
-            'project_id' => $this->config->projectId(),
-            'amount' => $normalizedAmount,
-            'currency' => $normalizedCurrency,
-            'external_order_id' => $externalOrderId,
-        );
-        if ($safeClientId !== '') {
-            $payload['client_id'] = $safeClientId;
-        }
-        if ($products !== null) {
-            $payload['products'] = $products;
-        }
 
         $meta = array(
             'invoices' => $invoices,
@@ -150,42 +209,134 @@ final class CheckoutService
         }
         $encodedMeta = json_encode($meta, JSON_UNESCAPED_SLASHES);
 
-        // Persist STATUS_CREATING intent BEFORE sending POST /v1/invoices.
-        $now = $this->now();
-        $intent = array(
-            'external_order_id' => $externalOrderId,
-            'paymos_invoice_id' => self::pendingInvoiceId($externalOrderId),
-            'platform_ref' => $platformRef,
-            'blesta_invoice_id' => $primaryInvoiceId,
-            'client_id' => $safeClientId !== '' ? $safeClientId : null,
-            'payload_meta' => is_string($encodedMeta) ? $encodedMeta : null,
-            'amount' => $normalizedAmount,
-            'currency' => $normalizedCurrency,
-            'environment' => $this->config->environment(),
-            'project_id' => $this->config->projectId(),
-            'payment_url' => '',
-            'transaction_id' => null,
-            'status' => self::STATUS_CREATING,
-            'final_status' => null,
-            'paid_late_noted' => null,
-            'expires_at' => null,
-            'renewal_attempt' => $renewAttempt,
-            'created_at' => $now,
-            'updated_at' => $now,
-        );
-        $this->snapshots->save($intent);
+        for ($try = 1; ; $try++) {
+            $externalOrderId = $this->buildExternalOrderId($platformRef, $renewAttempt);
 
-        $response = $this->client($this->config->environment())->invoices()->create($payload);
-        $bound = $this->bindCreatedInvoice($intent, $response);
+            $payload = array(
+                'project_id' => $this->config->projectId(),
+                'amount' => $normalizedAmount,
+                'currency' => $normalizedCurrency,
+                'external_order_id' => $externalOrderId,
+            );
+            if ($safeClientId !== '') {
+                $payload['client_id'] = $safeClientId;
+            }
+            if ($products !== null) {
+                $payload['products'] = $products;
+            }
 
-        return array(
-            'payment_url' => (string) $bound['payment_url'],
-            'paymos_invoice_id' => (string) $bound['paymos_invoice_id'],
-            'external_order_id' => (string) $bound['external_order_id'],
-            'amount' => $normalizedAmount,
-            'currency' => $normalizedCurrency,
-            'reused' => false,
-        );
+            // Persist STATUS_CREATING intent BEFORE sending POST /v1/invoices.
+            $now = $this->now();
+            $intent = array(
+                'external_order_id' => $externalOrderId,
+                'paymos_invoice_id' => self::pendingInvoiceId($externalOrderId),
+                'platform_ref' => $platformRef,
+                'blesta_invoice_id' => $primaryInvoiceId,
+                'client_id' => $safeClientId !== '' ? $safeClientId : null,
+                'payload_meta' => is_string($encodedMeta) ? $encodedMeta : null,
+                'amount' => $normalizedAmount,
+                'currency' => $normalizedCurrency,
+                'environment' => $this->config->environment(),
+                'project_id' => $this->config->projectId(),
+                'payment_url' => '',
+                'transaction_id' => null,
+                'status' => self::STATUS_CREATING,
+                'final_status' => null,
+                'paid_late_noted' => null,
+                'expires_at' => null,
+                'renewal_attempt' => $renewAttempt,
+                'created_at' => $now,
+                'updated_at' => $now,
+            );
+            $this->snapshots->save($intent);
+
+            try {
+                $response = $this->client($this->config->environment())->invoices()->create($payload);
+            } catch (ApiException $e) {
+                if (self::isDefinitiveRejection($e)) {
+                    $this->markCreateFailed($intent);
+                }
+                throw $e;
+            }
+
+            // This key was never sent by this installation: a final invoice in the answer belongs
+            // to someone else (another installation or an emptied database on the same project).
+            if ($this->responseIsFinal($response)) {
+                $this->markCreateFailed($intent);
+                $this->log('checkout.foreign_final_invoice', array(
+                    'external_order_id' => $externalOrderId,
+                    'status' => (string) ($response['status'] ?? ''),
+                ), 'warning');
+                if ($try >= self::MAX_FRESH_ATTEMPTS) {
+                    throw new \RuntimeException('Paymos answered a new checkout with a final invoice of another reference.');
+                }
+                $renewAttempt++;
+                continue;
+            }
+
+            $bound = $this->bindCreatedInvoice($intent, $response);
+
+            return array(
+                'payment_url' => (string) $bound['payment_url'],
+                'paymos_invoice_id' => (string) $bound['paymos_invoice_id'],
+                'external_order_id' => (string) $bound['external_order_id'],
+                'amount' => $normalizedAmount,
+                'currency' => $normalizedCurrency,
+                'reused' => false,
+            );
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $response
+     */
+    private function responseIsFinal(array $response): bool
+    {
+        $status = isset($response['status']) && is_scalar($response['status'])
+            ? strtolower(trim((string) $response['status']))
+            : '';
+        return $status !== '' && StatusMapper::isFinalStatus($status);
+    }
+
+    /**
+     * Close a creating intent; a row another request bound meanwhile is returned as it is.
+     *
+     * @param array<string, mixed> $intent
+     * @return array<string, mixed>
+     */
+    private function markCreateFailed(array $intent): array
+    {
+        $externalOrderId = (string) $intent['external_order_id'];
+        if ($this->snapshots->markCreateFailed($externalOrderId, (string) $intent['paymos_invoice_id'], self::STATUS_CREATING, self::STATUS_CREATE_FAILED)) {
+            $intent['status'] = self::STATUS_CREATE_FAILED;
+            return $intent;
+        }
+
+        $current = $this->snapshots->findByExternalOrderId($externalOrderId);
+        return is_array($current) ? $current : $intent;
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    private function paymentAwaitsBlesta(array $row): bool
+    {
+        if ($this->transactionLookup === null || trim((string) ($row['payment_url'] ?? '')) === '') {
+            return false;
+        }
+        $meta = SnapshotStore::decodeMeta(isset($row['payload_meta']) ? (string) $row['payload_meta'] : null);
+        $transactionId = trim((string) ($row['transaction_id'] ?? ''));
+        if (!empty($meta['blesta_transaction_confirmed']) || $transactionId === '') {
+            return false;
+        }
+
+        $known = call_user_func($this->transactionLookup, $transactionId);
+        if ($known === true) {
+            $this->snapshots->updateMetaFlag((string) $row['external_order_id'], 'blesta_transaction_confirmed', true);
+            return false;
+        }
+
+        return true;
     }
 
     public function formatSafeError(\Throwable $e, string $locale = 'en_us'): string
@@ -256,7 +407,23 @@ final class CheckoutService
             $payload['products'] = $products;
         }
 
-        $response = $this->client((string) $intent['environment'])->invoices()->create($payload);
+        try {
+            $response = $this->client((string) $intent['environment'])->invoices()->create($payload);
+        } catch (ApiException $e) {
+            if (!self::isDefinitiveRejection($e)) {
+                throw $e;
+            }
+            // Refused for good: the server holds no invoice for this key. Close the intent so
+            // the checkout goes on to the next key with the current amount.
+            $this->log('checkout.create_refused', array(
+                'external_order_id' => (string) $intent['external_order_id'],
+                'status' => $e->statusCode(),
+                'code' => $e->errorCode(),
+            ), 'warning');
+
+            return $this->markCreateFailed($intent);
+        }
+
         return $this->bindCreatedInvoice($intent, $response);
     }
 
@@ -322,7 +489,10 @@ final class CheckoutService
     private function keepsExistingInvoice(array $row): bool
     {
         $now = $this->now();
-        if (InvoiceRenewal::isRequired($row, $now)) {
+        // The stored expires_at is stale once the buyer confirms a network (the server moves the
+        // deadline without a webhook): only the recorded status may short-circuit; a passed local
+        // deadline is a reason to read the invoice back below.
+        if (InvoiceRenewal::isRequired(array('status' => (string) ($row['final_status'] ?? $row['status'] ?? '')), $now)) {
             return false;
         }
 
@@ -557,7 +727,9 @@ final class CheckoutService
                 ? $item['unit_amount']
                 : (array_key_exists('amount', $item) ? $item['amount'] : null);
             $unitAmount = AmountGuard::normalizeDecimal($rawUnit);
-            if ($unitAmount === null || $unitAmount === '0' || $unitAmount[0] === '-') {
+            // A free line (domain promo, 0.00 setup fee) is a valid product; only negative lines
+            // (discounts, credits) cannot be expressed and fall back to amount-only.
+            if ($unitAmount === null || $unitAmount[0] === '-') {
                 return null;
             }
 

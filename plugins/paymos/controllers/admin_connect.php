@@ -22,6 +22,14 @@ class AdminConnect extends PaymosController
         $this->connectClient = $client;
     }
 
+    /**
+     * Every Connect action is an AJAX call from the gateway settings page.
+     */
+    protected function respondsWithJson(): bool
+    {
+        return true;
+    }
+
     public function index()
     {
         $method = isset($_SERVER['REQUEST_METHOD']) ? strtoupper((string) $_SERVER['REQUEST_METHOD']) : 'GET';
@@ -66,7 +74,7 @@ class AdminConnect extends PaymosController
         if (strtoupper($method) !== 'POST') {
             return array(
                 'http_status' => 405,
-                'body' => array('error' => 'POST request is required.'),
+                'body' => $this->adminErrorBody('paymos_method_not_allowed'),
             );
         }
 
@@ -76,7 +84,7 @@ class AdminConnect extends PaymosController
         } catch (\Throwable $authError) {
             return array(
                 'http_status' => 403,
-                'body' => array('error' => $authError->getMessage()),
+                'body' => $this->adminErrorBody($authError->getMessage()),
             );
         }
 
@@ -106,7 +114,7 @@ class AdminConnect extends PaymosController
 
             return array(
                 'http_status' => 400,
-                'body' => array('error' => 'Invalid Connect action.'),
+                'body' => $this->adminErrorBody('paymos_invalid_action'),
             );
         } catch (\Throwable $error) {
             $locale = Translation::detectLocale();

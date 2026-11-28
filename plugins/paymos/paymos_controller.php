@@ -19,6 +19,7 @@ use PaymosBlesta\Config;
 use PaymosBlesta\CredentialStore;
 use PaymosBlesta\DbDriverInterface;
 use PaymosBlesta\PdoDbDriver;
+use PaymosBlesta\StaffPermissions;
 
 /**
  * Base Blesta plugin controller for Paymos admin endpoints (AdminConnect, AdminRefunds).
@@ -43,6 +44,9 @@ class PaymosController extends AppController
     /** @var array<string, mixed>|null */
     protected $metaOverride;
 
+    /** @var bool|null */
+    private $staffPermissionsActive;
+
     public function preAction(): void
     {
         if (isset($this->structure) && is_object($this->structure)
@@ -52,6 +56,12 @@ class PaymosController extends AppController
         $parentClass = get_parent_class($this);
         if (is_string($parentClass) && method_exists($parentClass, 'preAction')) {
             parent::preAction();
+        }
+        // Staff login + ACL on HTML pages: Blesta checks the staff group against the plugin
+        // permissions paymos.admin_connect / paymos.admin_refunds. JSON endpoints check the same
+        // permission in requireStaffAuth() and answer JSON 403 instead of a login redirect.
+        if (method_exists($this, 'requireLogin') && !$this->respondsWithJson() && $this->staffPermissionsActive()) {
+            $this->requireLogin();
         }
         if (isset($this->view) && is_object($this->view)) {
             $this->view->view = 'default';
@@ -121,6 +131,49 @@ class PaymosController extends AppController
         if (!is_numeric($staffId) || (int) $staffId <= 0) {
             throw new \RuntimeException('paymos_admin_access_denied', 403);
         }
+
+        if ($this->staffPermissionsActive() && !StaffPermissions::staffMayUse((int) $staffId, $this->aclAlias())) {
+            throw new \RuntimeException('paymos_admin_access_denied', 403);
+        }
+    }
+
+    /**
+     * Whether the current action answers JSON (fetch() callers expect JSON, not a redirect).
+     */
+    protected function respondsWithJson(): bool
+    {
+        return false;
+    }
+
+    /**
+     * Blesta ACO of this controller: plugin_dir.controller_file.
+     */
+    protected function aclAlias(): string
+    {
+        $controller = isset($this->controller) && is_string($this->controller) && $this->controller !== ''
+            ? $this->controller
+            : strtolower((string) preg_replace('/(?<!^)[A-Z]/', '_$0', static::class));
+
+        return StaffPermissions::PLUGIN_DIR . '.' . $controller;
+    }
+
+    /**
+     * The staff permissions are enforced only after they were granted (see StaffPermissions):
+     * until then the pages keep the access staff had before the permissions existed.
+     */
+    protected function staffPermissionsActive(): bool
+    {
+        if ($this->staffPermissionsActive !== null) {
+            return $this->staffPermissionsActive;
+        }
+
+        try {
+            $this->staffPermissionsActive = StaffPermissions::grantToAllStaffGroups($this->createCredentialStore());
+        } catch (\Throwable $e) {
+            $this->staffPermissionsActive = false;
+        }
+
+        return $this->staffPermissionsActive;
     }
 
     /**
@@ -222,16 +275,47 @@ class PaymosController extends AppController
         return '';
     }
 
+    /**
+     * Admin base URI including the Blesta web directory (subfolder installs, no mod_rewrite).
+     */
     protected function resolveAdminRoutePrefix(): string
     {
-        $adminRoute = '/admin/';
-        if (class_exists('Configure') && method_exists('Configure', 'get')) {
-            $route = \Configure::get('Route.admin');
-            if (is_scalar($route) && trim((string) $route) !== '') {
-                $adminRoute = '/' . trim((string) $route, '/') . '/';
-            }
+        if (isset($this->base_uri) && is_string($this->base_uri) && trim($this->base_uri) !== '') {
+            return rtrim(trim($this->base_uri), '/') . '/';
         }
-        return $adminRoute;
+
+        return Config::adminUri('', defined('WEBDIR') ? (string) WEBDIR : null);
+    }
+
+    /**
+     * JSON error body for an access/CSRF/method failure: translated text plus the machine reason.
+     *
+     * @return array{error: string, reason: string}
+     */
+    protected function adminErrorBody(string $reason): array
+    {
+        $keys = array(
+            'paymos_admin_access_denied' => 'PaymosPlugin.error.access_denied',
+            'paymos_csrf_invalid' => 'PaymosPlugin.error.csrf_invalid',
+            'paymos_method_not_allowed' => 'PaymosPlugin.error.method_not_allowed',
+            'paymos_invalid_action' => 'PaymosPlugin.error.invalid_action',
+        );
+
+        return array(
+            'error' => isset($keys[$reason]) ? self::pluginText($keys[$reason]) : self::pluginText('PaymosPlugin.error.access_denied'),
+            'reason' => $reason,
+        );
+    }
+
+    protected static function pluginText(string $key): string
+    {
+        static $loaded = false;
+        if (!$loaded && class_exists('Language') && method_exists('Language', 'loadLang')) {
+            Language::loadLang('paymos_plugin', null, __DIR__ . DIRECTORY_SEPARATOR . 'language' . DIRECTORY_SEPARATOR);
+            $loaded = true;
+        }
+
+        return class_exists('Language') && method_exists('Language', '_') ? (string) Language::_($key, true) : $key;
     }
 
     protected function resolveBlestaBaseUrl(?string $override = null): string

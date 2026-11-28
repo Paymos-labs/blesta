@@ -4,12 +4,16 @@ declare(strict_types=1);
 
 namespace PaymosBlesta;
 
+use Paymos\Exception\EventInProgressException;
 use Paymos\Plugin\StatusMapper;
 
 final class SnapshotStore
 {
     public const TABLE = 'paymos_invoice_snapshots';
     public const STATUS_BLESTA_INVOICE_MISSING = 'blesta_invoice_missing';
+
+    /** How many recent multi-invoice payments are searched when a refund names one of their invoices. */
+    private const MULTI_INVOICE_SCAN_LIMIT = 500;
 
     /** @var DbDriverInterface */
     private $db;
@@ -269,7 +273,12 @@ final class SnapshotStore
             return $row;
         }
 
-        return $this->findLatestByPlatformRef('inv_' . $invoiceId);
+        $row = $this->findLatestByPlatformRef('inv_' . $invoiceId);
+        if ($row !== null) {
+            return $row;
+        }
+
+        return $this->findMultiInvoicePayment($invoiceId, false);
     }
 
     /**
@@ -293,12 +302,127 @@ final class SnapshotStore
             return $row;
         }
 
-        return $this->db->fetchOne(
+        $row = $this->db->fetchOne(
             'SELECT * FROM ' . self::TABLE
             . " WHERE platform_ref = ? AND status IN ('paid', 'paid_over')"
             . ' ORDER BY updated_at DESC LIMIT 1',
             array('inv_' . $invoiceId)
         );
+        if ($row !== null) {
+            return $row;
+        }
+
+        return $this->findMultiInvoicePayment($invoiceId, true);
+    }
+
+    /**
+     * Every recorded Paymos payment (paid / paid_over) that covers a Blesta invoice: a partial
+     * payment, the rest paid later, a payment of several invoices. Newest first.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function findPaidPaymentsForBlestaInvoice(int $invoiceId): array
+    {
+        if ($invoiceId <= 0) {
+            return array();
+        }
+
+        $this->ensureSchema();
+
+        $rows = array_merge(
+            $this->db->fetchAll(
+                'SELECT * FROM ' . self::TABLE
+                . " WHERE blesta_invoice_id = ? AND status IN ('paid', 'paid_over')"
+                . ' ORDER BY updated_at DESC',
+                array($invoiceId)
+            ),
+            $this->db->fetchAll(
+                'SELECT * FROM ' . self::TABLE
+                . " WHERE platform_ref = ? AND status IN ('paid', 'paid_over')"
+                . ' ORDER BY updated_at DESC',
+                array('inv_' . $invoiceId)
+            )
+        );
+
+        $multi = $this->db->fetchAll(
+            'SELECT * FROM ' . self::TABLE
+            . " WHERE blesta_invoice_id IS NULL AND status IN ('paid', 'paid_over')"
+            . ' ORDER BY updated_at DESC LIMIT ' . self::MULTI_INVOICE_SCAN_LIMIT
+        );
+        foreach ($multi as $row) {
+            if (in_array($invoiceId, self::invoiceIds($row), true)) {
+                $rows[] = $row;
+            }
+        }
+
+        $unique = array();
+        foreach ($rows as $row) {
+            $unique[(string) $row['external_order_id']] = $row;
+        }
+        $result = array_values($unique);
+        usort($result, static function (array $a, array $b): int {
+            return ((int) ($b['updated_at'] ?? 0)) <=> ((int) ($a['updated_at'] ?? 0));
+        });
+
+        return $result;
+    }
+
+    /**
+     * One Paymos payment may close several Blesta invoices (blesta_invoice_id is then NULL and
+     * the invoices live in payload_meta). Finds the latest such payment that covers $invoiceId.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function findMultiInvoicePayment(int $invoiceId, bool $paidOnly): ?array
+    {
+        $sql = 'SELECT * FROM ' . self::TABLE . ' WHERE blesta_invoice_id IS NULL';
+        if ($paidOnly) {
+            $sql .= " AND status IN ('paid', 'paid_over')";
+        }
+        $sql .= ' ORDER BY updated_at DESC LIMIT ' . self::MULTI_INVOICE_SCAN_LIMIT;
+
+        foreach ($this->db->fetchAll($sql) as $row) {
+            if (in_array($invoiceId, self::invoiceIds($row), true)) {
+                return $row;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Blesta invoice IDs a snapshot pays, in the order they were stored (ascending).
+     *
+     * @param array<string, mixed> $snapshot
+     * @return array<int, int>
+     */
+    public static function invoiceIds(array $snapshot): array
+    {
+        $meta = self::decodeMeta(isset($snapshot['payload_meta']) ? (string) $snapshot['payload_meta'] : null);
+        $ids = array();
+        if (isset($meta['invoices']) && is_array($meta['invoices'])) {
+            foreach ($meta['invoices'] as $item) {
+                if (is_array($item) && isset($item['id']) && is_numeric($item['id']) && (int) $item['id'] > 0) {
+                    $ids[] = (int) $item['id'];
+                }
+            }
+        }
+        if (count($ids) > 0) {
+            return $ids;
+        }
+
+        if (isset($snapshot['blesta_invoice_id']) && is_numeric($snapshot['blesta_invoice_id']) && (int) $snapshot['blesta_invoice_id'] > 0) {
+            return array((int) $snapshot['blesta_invoice_id']);
+        }
+        if (isset($meta['blesta_invoice_id']) && is_numeric($meta['blesta_invoice_id']) && (int) $meta['blesta_invoice_id'] > 0) {
+            return array((int) $meta['blesta_invoice_id']);
+        }
+        if (isset($snapshot['platform_ref']) && is_string($snapshot['platform_ref'])
+            && preg_match('/\Ainv_([1-9][0-9]*)\z/', $snapshot['platform_ref'], $m) === 1) {
+            return array((int) $m[1]);
+        }
+
+        return array();
     }
 
     /**
@@ -331,7 +455,7 @@ final class SnapshotStore
 
         return $this->db->fetchAll(
             'SELECT * FROM ' . self::TABLE
-            . " WHERE status NOT IN ('creating', 'paid', 'paid_over', 'underpaid', 'expired', 'cancelled', 'blesta_invoice_missing')"
+            . " WHERE status NOT IN ('creating', 'create_failed', 'paid', 'paid_over', 'underpaid', 'expired', 'cancelled', 'blesta_invoice_missing')"
             . ' AND created_at >= ?'
             . ' ORDER BY created_at ASC LIMIT ' . $safeLimit,
             array($since)
@@ -353,19 +477,58 @@ final class SnapshotStore
             'updated_at' => $this->now(),
         );
 
+        $where = array('paymos_invoice_id' => $paymosInvoiceId);
         if (StatusMapper::isFinalStatus($status)) {
             $set['final_status'] = $status;
+        } else {
+            // A late non-final event never overwrites a recorded final status.
+            $where['final_status'] = null;
         }
 
         if ($transactionId !== null && trim($transactionId) !== '') {
             $set['transaction_id'] = trim($transactionId);
         }
 
-        $this->db->casUpdate(
+        $this->db->casUpdate(self::TABLE, $set, $where);
+    }
+
+    /**
+     * Run $action while holding the payment lock of one Paymos invoice, shared by the webhook
+     * and the cron reconciler so the two never record the same payment side by side.
+     *
+     * @return mixed
+     */
+    public function withPaymentLock(string $paymosInvoiceId, callable $action)
+    {
+        $lockName = 'paymos-blesta-pay:' . trim($paymosInvoiceId);
+        if (!$this->db->acquireNamedLock($lockName, 10)) {
+            throw new EventInProgressException('paymos_payment_busy');
+        }
+
+        try {
+            return $action();
+        } finally {
+            $this->db->releaseNamedLock($lockName);
+        }
+    }
+
+    /**
+     * Compare-and-set a creating intent to its failed status; false when the row is no longer
+     * that intent (another request bound it to an invoice meanwhile).
+     */
+    public function markCreateFailed(string $externalOrderId, string $pendingInvoiceId, string $creatingStatus, string $failedStatus): bool
+    {
+        $this->ensureSchema();
+
+        return $this->db->casUpdate(
             self::TABLE,
-            $set,
-            array('paymos_invoice_id' => $paymosInvoiceId)
-        );
+            array('status' => $failedStatus, 'updated_at' => $this->now()),
+            array(
+                'external_order_id' => $externalOrderId,
+                'paymos_invoice_id' => $pendingInvoiceId,
+                'status' => $creatingStatus,
+            )
+        ) > 0;
     }
 
     public function markPaidLateNoted(string $externalOrderId, string $marker): void

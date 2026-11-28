@@ -9,3 +9,7 @@ $lang['PaymosPlugin.error.access_denied'] = 'Administrator authorization is requ
 $lang['PaymosPlugin.error.csrf_invalid'] = 'Invalid CSRF token. Reload the page and try again.';
 $lang['PaymosPlugin.error.method_not_allowed'] = 'POST request is required.';
 $lang['PaymosPlugin.error.not_connected'] = 'Paymos is not connected. Open Paymos gateway settings and click Connect Paymos.';
+$lang['PaymosPlugin.error.invalid_action'] = 'Unknown Connect action.';
+$lang['PaymosPlugin.permission.admin_main'] = 'Paymos';
+$lang['PaymosPlugin.permission.admin_connect'] = 'Connect Paymos';
+$lang['PaymosPlugin.permission.admin_refunds'] = 'Paymos Refunds';
